@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "Golden vectors for the ladder's target/stop math.",
+    "",
+    "This math exists TWICE: core/exits.py computes what is actually traded, and",
+    "LadderModal's preview shows the user what they are about to arm. Two",
+    "implementations of one formula, in two languages, with nothing holding them",
+    "together — and they drifted: the dialog measured the first-buy offset from",
+    "the highest level it displayed while the backend measured it from the",
+    "highest level posted, so a 200-point target was stored as 600 and inherited",
+    "by every rung below it.",
+    "",
+    "Both sides now assert against this file. If either changes, its test fails.",
+    "Python: backend/tests/test_exit_math.py  ·  TypeScript: frontend/src/ladderMath.test.ts"
+  ],
+  "target": [
+    {
+      "name": "first rung anchors on its own entry, full offset",
+      "inst": {"target_mode": "points", "target_value": 200, "target_chain_pct": 100},
+      "entry": 15390, "prev": null,
+      "expect_target": 15590, "expect_anchor": 15390
+    },
+    {
+      "name": "chained rung anchors on the rung above it",
+      "inst": {"target_mode": "points", "target_value": 200, "target_chain_pct": 100},
+      "entry": 15190, "prev": 15390,
+      "expect_target": 15590, "expect_anchor": 15390
+    },
+    {
+      "name": "chain percent shrinks the offset, not the anchor",
+      "inst": {"target_mode": "points", "target_value": 200, "target_chain_pct": 50},
+      "entry": 15190, "prev": 15390,
+      "expect_target": 15490, "expect_anchor": 15390
+    },
+    {
+      "name": "percent mode computes the offset on the anchor",
+      "inst": {"target_mode": "percent", "target_value": 2, "target_chain_pct": 100},
+      "entry": 1000, "prev": null,
+      "expect_target": 1020, "expect_anchor": 1000
+    },
+    {
+      "name": "percent mode chained: offset comes off the ANCHOR price, not the entry",
+      "inst": {"target_mode": "percent", "target_value": 2, "target_chain_pct": 100},
+      "entry": 1000, "prev": 1100,
+      "expect_target": 1122, "expect_anchor": 1100
+    },
+    {
+      "name": "anchor below entry would exit instantly -> falls back to self-anchored",
+      "inst": {"target_mode": "points", "target_value": 200, "target_chain_pct": 100},
+      "entry": 15390, "prev": 15100,
+      "expect_target": 15590, "expect_anchor": 15390
+    },
+    {
+      "name": "zero chain percent still cannot target at or below entry",
+      "inst": {"target_mode": "points", "target_value": 200, "target_chain_pct": 0},
+      "entry": 15190, "prev": 15390,
+      "expect_target": 15390, "expect_anchor": 15390
+    }
+  ],
+  "sl": [
+    {
+      "name": "points stop sits its offset below the entry",
+      "inst": {"sl_enabled": true, "sl_mode": "points", "sl_value": 200},
+      "entry": 15390, "expect_sl": 15190
+    },
+    {
+      "name": "percent stop computes on the entry",
+      "inst": {"sl_enabled": true, "sl_mode": "percent", "sl_value": 2},
+      "entry": 1000, "expect_sl": 980
+    },
+    {
+      "name": "stop-losses disabled means exactly zero, the engine's 'no stop'",
+      "inst": {"sl_enabled": false, "sl_mode": "points", "sl_value": 200},
+      "entry": 15390, "expect_sl": 0
+    },
+    {
+      "name": "offset wider than the price computes at or below zero (refused at entry)",
+      "inst": {"sl_enabled": true, "sl_mode": "points", "sl_value": 500},
+      "entry": 200, "expect_sl": -300
+    }
+  ]
+}

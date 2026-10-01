@@ -1,0 +1,73 @@
+// ============================================================
+// main.afl — strategy entry point
+// Put indicators.afl, setup_*.afl, risk_management.afl
+// in the AFL standard include folder (Tools > Preferences > AFL).
+// ============================================================
+
+_SECTION_BEGIN("Trade Settings");
+LotSize   = Param("Lot Size", 65, 1, 5000, 1);
+Lots      = Param("Lots per trade", 2, 1, 100, 1);   // >= 2 lots needed for a partial exit
+EntryTime = ParamTime("Entry candle time", "09:20:00");
+DefaultSL = Param("Default SL (points) if setup gives none", 20, 0.05, 1000, 0.05);
+_SECTION_END();
+
+// ---- Backtest options (NSE futures, quantities in shares, multiples of a lot) ----
+SetTradeDelays(0, 0, 0, 0);
+SetOption("FuturesMode", True);
+SetOption("InitialEquity", 1000000);
+SetOption("MaxOpenPositions", 1);
+SetOption("AllowSameBarExit", False);
+TickSize      = 0.05;
+RoundLotSize  = LotSize;
+PointValue    = 1;
+MarginDeposit = 0;
+
+tn     = TimeNum();
+newDay = Day() != Ref(Day(), -1);
+
+#include_once <indicators.afl>
+#include_once <setup_template.afl>
+// #include_once <setup_2.afl>
+
+// ---- Combine setups into signals ----
+Buy   = S1_Long;          // OR S2_Long ...
+Short = S1_Short;         // OR S2_Short ...
+Sell  = 0;
+Cover = 0;
+
+BuyPrice   = Open;         // fill at open of the signal bar (conditions use completed data)
+ShortPrice = Open;
+
+// Which setup fired (for exploration). Highest priority first.
+SigSetup = IIf(S1_Long OR S1_Short, 1, 0);
+
+// Stop levels as prices; fall back to DefaultSL points
+LongSL  = IIf(IsNull(S1_LongSL),  Open - DefaultSL, S1_LongSL);
+ShortSL = IIf(IsNull(S1_ShortSL), Open + DefaultSL, S1_ShortSL);
+
+#include_once <risk_management.afl>   // sets Sell/Cover/scale-outs, cleans repeats
+
+// ---- Position size: entry size, then scale-out % on T1 bars ----
+SetPositionSize(LotSize * Lots, spsShares);
+SetPositionSize(T1ExitPct, spsPercentOfPosition * (Buy == sigScaleOut OR Short == sigScaleOut));
+
+// ---- Chart ----
+_SECTION_BEGIN("Chart");
+Plot(C, "Price", colorDefault, styleCandle);
+PlotShapes(IIf(Buy == True, shapeUpArrow, shapeNone), colorGreen, 0, Low);
+PlotShapes(IIf(Short == True, shapeDownArrow, shapeNone), colorRed, 0, High);
+PlotShapes(IIf(Sell OR Buy == sigScaleOut, shapeHollowDownArrow, shapeNone), colorOrange, 0, High);
+PlotShapes(IIf(Cover OR Short == sigScaleOut, shapeHollowUpArrow, shapeNone), colorOrange, 0, Low);
+_SECTION_END();
+
+// ---- Exploration: verify signals against the strategy doc ----
+Filter = Buy OR Sell OR Short OR Cover;
+AddColumn(SigSetup, "Setup", 1.0);
+AddColumn(IIf(Buy == True, 1, IIf(Buy == sigScaleOut, 2, 0)), "Buy(1)/T1(2)", 1.0);
+AddColumn(BuyPrice, "BuyPx", 1.2);
+AddColumn(Sell, "Sell", 1.0);
+AddColumn(SellPrice, "SellPx", 1.2);
+AddColumn(IIf(Short == True, 1, IIf(Short == sigScaleOut, 2, 0)), "Short(1)/T1(2)", 1.0);
+AddColumn(ShortPrice, "ShortPx", 1.2);
+AddColumn(Cover, "Cover", 1.0);
+AddColumn(CoverPrice, "CoverPx", 1.2);

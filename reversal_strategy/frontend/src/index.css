@@ -1,0 +1,130 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Dark-only, Gateway-style theme.
+
+   The dashboard is written entirely in light-mode utilities (bg-white,
+   text-slate-800, border-slate-200 …). Tailwind v4 compiles those to
+   var(--color-*), so remapping the palette flips the whole app from one place —
+   no `dark:` variant threaded through any component, and anything added later
+   inherits the theme for free.
+
+   There is no light mode any more: main.tsx pins data-theme="dark", so the base
+   :root below is also dark to kill any pre-JS white flash. The palette mirrors
+   the Gateway console — a neutral charcoal ramp (no blue cast) with a single
+   blue accent, flat surfaces, and green/red only for P&L.
+--------------------------------------------------------------------------- */
+
+:root {
+  color-scheme: dark;
+}
+
+/* min-height, not height: Open Positions renders every row rather than
+   scrolling inside itself, so the document has to be free to grow past the
+   viewport and scroll. A fixed 100% height clipped it. */
+html, body, #root {
+  min-height: 100%;
+  margin: 0;
+  background: #0a0e17;
+  color: #f1f3f6;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a3444; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4658; }
+
+@keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+.pulse { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+@keyframes slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
+.slide-in { animation: slide-in 0.22s ease-out; }
+
+/* ---------------------------------------------------------------------------
+   Palette remap.
+
+   The slate ramp is inverted (50 = darkest surface, 800 = brightest text) so
+   the existing light-mode contrast relationships hold. It carries a neutral
+   grey cast — Gateway's charcoal, not the previous navy. Accent tints — the
+   -50/-100 badge washes — become dark washes, while the -600/-700 text shades
+   brighten to stay legible on them.
+--------------------------------------------------------------------------- */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Panel surface — gray-900. Everything on bg-white sits on this. */
+  --color-white: #111827;
+
+  --color-slate-50:  #0f1520;
+  --color-slate-100: #1b2230;
+  --color-slate-200: #2a3444;
+  --color-slate-300: #4b5563;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #aab4c2;
+  --color-slate-600: #c4ccd6;
+  --color-slate-700: #dde2e9;
+  --color-slate-800: #f1f3f6;
+  --color-slate-900: #f9fafb;
+
+  --color-emerald-50:  #0c2a20;
+  --color-emerald-100: #113a2c;
+  --color-emerald-200: #1d5942;
+  --color-emerald-300: #2b7a5b;
+  --color-emerald-500: #34d399;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+
+  --color-rose-50:  #33121b;
+  --color-rose-100: #451721;
+  --color-rose-200: #6b2130;
+  --color-rose-300: #8f2c3f;
+  --color-rose-500: #fb7185;
+  --color-rose-600: #fb7185;
+  --color-rose-700: #fda4af;
+  --color-rose-800: #fecdd3;
+
+  --color-amber-50:  #32240a;
+  --color-amber-100: #43300d;
+  --color-amber-200: #6b4c15;
+  --color-amber-300: #8f661d;
+  --color-amber-500: #fbbf24;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+
+  /* Accent — Gateway blue (blue-600 primary), replacing the previous cyan sky. */
+  --color-sky-50:  #0d1f3a;
+  --color-sky-100: #14294a;
+  --color-sky-200: #1e3a63;
+  --color-sky-300: #2b62c9;
+  --color-sky-400: #3b82f6;
+  --color-sky-500: #3b82f6;
+  --color-sky-600: #2563eb;
+  --color-sky-700: #1d4ed8;
+  --color-sky-800: #93c5fd;
+
+  --color-indigo-50:  #191c3d;
+  --color-indigo-100: #222652;
+  --color-indigo-200: #343a7e;
+  --color-indigo-300: #454ca8;
+  --color-indigo-500: #818cf8;
+  --color-indigo-600: #818cf8;
+  --color-indigo-700: #a5b4fc;
+  --color-indigo-800: #c7d2fe;
+
+  --color-violet-50:  #23163d;
+  --color-violet-100: #2f1d52;
+  --color-violet-200: #482e7e;
+  --color-violet-300: #603ea8;
+  --color-violet-600: #a78bfa;
+  --color-violet-700: #c4b5fd;
+}
+
+::-webkit-scrollbar-thumb:hover { background: #3a4658; }
+
+/* Native controls (date pickers, selects, checkboxes) follow the theme. */
+input, select, textarea { color-scheme: dark; }

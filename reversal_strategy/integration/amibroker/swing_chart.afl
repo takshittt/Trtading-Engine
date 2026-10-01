@@ -1,0 +1,41 @@
+// swing_chart.afl — CHART indicator (visual only).
+//
+// Apply this to a CHART to SEE the same Buy/Sell the scanner produces, as
+// arrows on the price. It does NO file writing and NO exploration — so it is
+// safe on a chart and never conflicts with swing_scan.afl (the Analysis file).
+//
+// Keep the strategy rule here identical to swing_scan.afl.
+
+_SECTION_BEGIN("ReversalStrategyChart");
+
+// ---- price ----------------------------------------------------------------
+Plot(Close, "Close", colorDefault, styleCandle);
+
+// ---- same strategy as the scanner ----------------------------------------
+fast = EMA(Close, 9);
+slow = EMA(Close, 21);
+Plot(fast, "EMA9",  colorAqua, styleLine);
+Plot(slow, "EMA21", colorOrange, styleLine);
+
+Buy  = Cross(fast, slow);
+Sell = Cross(slow, fast);
+Buy  = ExRem(Buy, Sell);
+Sell = ExRem(Sell, Buy);
+
+// ---- arrows ---------------------------------------------------------------
+PlotShapes(IIf(Buy,  shapeUpArrow,   shapeNone), colorGreen, 0, Low,  -15);
+PlotShapes(IIf(Sell, shapeDownArrow, shapeNone), colorRed,   0, High,  15);
+
+// The RIGHTMOST arrow can repaint: during the session the last bar is still
+// forming, so a cross shown there may vanish before the candle closes. The
+// scanner deliberately ignores that bar and acts on the one before it, so what
+// you see at the hard right edge is not necessarily what will be traded.
+// This band marks the forming bar the scanner skips.
+formingBar = BarIndex() >= LastValue(BarIndex()) - 0;
+Plot(formingBar, "", ColorRGB(60, 60, 60), styleArea | styleOwnScale, 0, 1, 0, -2);
+
+// optional: highlight the last-bar state in the title
+_N(Title = StrFormat("{{NAME}}  {{DATE}}  Close=%.2f  ATR=%.2f",
+                     LastValue(Close), LastValue(ATR(14))));
+
+_SECTION_END();

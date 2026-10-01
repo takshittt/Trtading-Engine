@@ -1,0 +1,13 @@
+{
+  "_note": "Exchange trading holidays (full-day closes). Used to shift rollover dates onto the previous trading day and to treat the market as closed. 'common' applies to every exchange; add exchange-specific extras under 'NFO' / 'MCX' (e.g. days MCX trades only the evening session can be REMOVED from MCX by listing them only under NFO). Dates are YYYY-MM-DD. Verify each year against the NSE/MCX holiday circulars — this seed list covers 2025-2026 as best known.",
+  "common": [
+    "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14",
+    "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-27", "2025-10-02",
+    "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25",
+    "2026-01-26", "2026-03-04", "2026-03-21", "2026-03-31", "2026-04-03",
+    "2026-04-14", "2026-05-01", "2026-08-15", "2026-09-14", "2026-10-02",
+    "2026-10-20", "2026-11-09", "2026-11-24", "2026-12-25"
+  ],
+  "NFO": [],
+  "MCX": []
+}

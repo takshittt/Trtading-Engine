@@ -1,0 +1,37 @@
+[project]
+name = "grid-backend"
+version = "0.1.0"
+description = "Grid ladder (grid) strategy engine"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.26",
+    "websockets>=12.0",
+    "pydantic>=2.5",
+    "python-dateutil>=2.8",
+    "sqlalchemy>=2.0",
+    "PyMySQL>=1.1.0",
+    "PyJWT>=2.8.0",
+    "python-dotenv>=1.0",
+    "psycopg[binary] (>=3.2)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0"
+
+# Extra deps for the OPTIONAL backtest module only — the live engine never
+# imports these. Install with: poetry install --with backtest
+[tool.poetry.group.backtest]
+optional = true
+
+[tool.poetry.group.backtest.dependencies]
+yfinance = ">=0.2.40"
+pandas = ">=2.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

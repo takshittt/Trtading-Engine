@@ -1,0 +1,821 @@
+// swing_scan_bb_1d.afl — Reversal Strategy scan exporter, Bollinger-Band swing strategy, 1D
+//
+// Drop-in replacement for swing_scan.afl on DAILY charts. Run as an Exploration
+// with Auto-repeat every 1 minute. The repeat interval is only how often we LOOK;
+// the signal bar is always a closed candle, so a daily scan emits at most one
+// signal per symbol per day no matter how often it runs.
+//
+// The 4H twin is swing_scan_bb_4h.afl. The two differ ONLY in the constants in
+// SECTION 1 — keep any logic change in step across both files.
+//
+// Uses only basic AFL (no ternary, no function-result indexing) for maximum
+// compatibility, matching the convention of the swing_scan.afl it replaces.
+//
+// ---------------------------------------------------------------------------
+// STRATEGY: long-only mean reversion off the lower Bollinger Band. Two MANDATORY
+// core conditions (trend + band rejection) plus a SCORED set of five
+// corroborating filters, so that "price touches the lower band then keeps
+// falling" is filtered out without the scan going silent for weeks. Stop and
+// Target come from swing-pivot support / resistance.
+//
+// ANALYSIS RANGE: "All quotations", or "n last quotations" with n comfortably
+// above backfillBars + 2 — 30 is a safe number. Buy/Sell are only ever written
+// up to the last CLOSED bar, so a 1-bar range examines the still-forming candle
+// where Buy is 0 by construction and the Exploration shows nothing at all
+// whatever the strategy did. Do not compute the minimum exactly: with "Pad and
+// align to reference symbol" on, a thin symbol carries zero-volume pad bars at
+// the end, the closed-candle walk below steps back past them, and a range sized
+// to the tick lands short of the bar the row is on.
+//
+// The range only limits which rows you SEE. The CSV export runs over the closed
+// bars regardless, so a badly-set range hides signals from the Exploration
+// without stopping them reaching the backend — check both before concluding the
+// scan is quiet.
+// ---------------------------------------------------------------------------
+
+_SECTION_BEGIN("ReversalStrategyScanBB1D");
+
+// ---- timeframe guard -----------------------------------------------------
+// The backend only accepts 60, 240 and 1440 and rejects anything else loudly.
+// SCRIPT_TF is hardcoded rather than derived because the whole point of having
+// two files is that the thresholds differ: running the 1D file on a 4H chart
+// would silently apply daily's looser RSI/MFI to 4H bars. So this file refuses
+// to write anything unless it is actually on a daily chart.
+TF_MIN    = Interval() / 60;
+SCRIPT_TF = 1440;
+TF_OK     = TF_MIN == SCRIPT_TF;
+
+// ---- SECTION 1: CONSTANTS THAT DIFFER BETWEEN 4H AND 1D -------------------
+// These were 35/30 while the filters were ANDed and each one was a veto. They
+// are scored now — the bar to clear is "3 of 5 agree" — so a threshold that
+// vetoes nothing on its own can afford to describe the actual timeframe instead
+// of guarding against it. Daily stays looser than 4H in absolute terms because
+// RSI(14) on daily spans 14 sessions and mean-reverts less far than the 4H one.
+RSILevel   = Param("RSI Oversold", 45, 15, 55, 1);   // 1D = 45   (4H file = 40)
+MFILevel   = Param("MFI Oversold", 40, 10, 50, 1);   // 1D = 40   (4H file = 35)
+
+// The trend EMA is a per-timeframe constant, not a shared one: 200 bars is 200
+// TRADING DAYS here but only ~100 on the 4H file (two bars a session), so the
+// same number is two different filters. It used to sit in the shared section,
+// which quietly made the 4H trend gate half the horizon of this one. 200 daily
+// bars is the standard long-trend line and stays as it was.
+EMALen     = Param("Trend EMA Period", 200, 50, 400, 10);  // 1D = 200 (4H = 100)
+
+// How F1 reads the trend. This is the single most restrictive gate in the file
+// and it deserves a dial, because "Close > EMA" is in tension with the name of
+// the strategy: a BOTTOM forms below the long EMA, so the strict form cannot buy
+// one — it only buys pullbacks inside an established uptrend.
+//   0 = Close > EMA. Strict momentum, the original behaviour.
+//   1 = Close > EMA, OR the EMA has stopped falling over EMASlopeLB bars. Lets
+//       the scan work a base while the long trend flattens — which is where
+//       bottoms are — without buying into a freefall.
+//   2 = off. Use this to find out how much of the silence is F1 and nothing
+//       else; do not run it live, it will buy knives.
+TrendMode  = Param("Trend Mode (0=strict 1=base 2=off)", 1, 0, 2, 1);
+EMASlopeLB = Param("EMA Slope Lookback", 10, 3, 40, 1);
+
+// On daily bars 5 each side of a pivot is a trading week, which is the standard
+// swing-pivot definition.
+PivotStrength = Param("Pivot Strength (bars each side)", 5, 2, 10, 1);
+SRLookback    = Param("S/R Lookback (bars)", 120, 40, 250, 10);
+
+// Anti-repeat: on daily, 3 bars is three trading days. The gap is wider than 4H
+// because a daily bar covers more ground, so 2% is normal noise here.
+MinBarsBetween = Param("Min Bars Between Signals", 3, 1, 30, 1);
+MinGapPct      = Param("Min % Drop To Re-signal", 3.0, 0.0, 15.0, 0.25);
+
+// ---- SECTION 2: SHARED PARAMETERS ----------------------------------------
+BBPeriod  = Param("BB Period", 20, 10, 50, 1);
+BBWidth   = Param("BB Std Dev", 2, 1.5, 3, 0.1);
+RSIPeriod = Param("RSI Period", 14, 7, 21, 1);
+MFIPeriod = Param("MFI Period", 14, 7, 21, 1);
+ATRPeriod = Param("ATR Period", 14, 7, 21, 1);
+
+PctBOversold = Param("%B Oversold Threshold", 0, -0.2, 0.1, 0.05);
+
+// How long a poke below the band stays a live setup. 1 = the reversal must come
+// on the very next bar, which is what this was and why 4H found nothing: a base
+// pokes under, chops for two or three bars, then turns. 3 bars on daily is
+// three sessions of patience. The confirmations still have to land on the
+// reversal bar, so this widens the window to wait in, not the standard to meet.
+PokeLB       = Param("Band Poke Lookback (bars)", 3, 1, 10, 1);
+
+// Where the recovery close has to land inside the band. 0.3 meant the bottom
+// 30%, which rejects the strongest reversals — a wide green bar off the low
+// often closes near the middle band, and that is a better entry than a limp one
+// that barely crawls back inside. 0.5 keeps "do not chase" without punishing
+// conviction.  TIP: if you still want more signals, raise this to 0.75.
+PctBRecover  = Param("%B Recovery Ceiling", 0.5, 0.15, 0.8, 0.05);
+PctBRearm    = Param("%B Re-arm Level", 0.5, 0.3, 0.9, 0.05);
+WBottomLB    = Param("W-Bottom Lookback", 20, 10, 40, 1);
+
+// Both relaxed for the same reason as RSI/MFI: they are votes now, not vetoes.
+// A 0.5 body ratio demands a near-marubozu, and a reversal bar off a low very
+// often carries a long lower wick — which is bullish, and which the old
+// threshold read as failure.
+BodyMin      = Param("Min Candle Body Ratio", 0.35, 0.2, 0.8, 0.05);
+
+// The floor on F7's second leg. 0.5 rather than 0.7 because F7 is an OR now —
+// see the filter itself. This has to stay wired to the filter: a Param that the
+// code ignores still appears in the dialog and still looks like a working dial,
+// so turning it does nothing and the next person debugging a quiet scan spends
+// an afternoon on it.
+VolFactor    = Param("Min Volume vs 20-bar Avg", 0.5, 0.3, 2.0, 0.1);
+
+// How the "price was under the band" leg is measured. 0 = the previous bar must
+// have CLOSED below the lower band; 1 = it only has to have TRADED below it.
+// A close below a 2-sigma band is a ~2%-of-bars event, and demanding one is most
+// of the reason an ANDed filter stack goes quiet for weeks. A wick under the
+// band with the close back inside is the same rejection — sellers pushed under
+// and could not hold it — and it happens roughly three times as often.
+TouchMode = Param("Band Touch Mode (0=close 1=wick)", 1, 0, 1, 1);
+
+// The seven filters used to be ANDed, so a signal needed all seven to agree on
+// one bar. Two of them ARE the strategy (trend + band rejection) and stay
+// mandatory; the other five are corroboration, and requiring every one of them
+// multiplies five roughly-30% conditions down to ~0.2%. Scoring them makes
+// strictness a dial instead of a cliff: 5 = the old all-or-nothing behaviour,
+// 3 = a normal amount of signal, 0 = core only.
+MinConfirm = Param("Confirmations Required (of 5)", 3, 0, 5, 1);
+
+// 0 = OFF, and off is the default. The squeeze floor is a HARD veto, not a vote,
+// so it cost a flat percentage of every symbol's bars — at 15 it threw away the
+// bottom 15% outright, and the HYUNDAI bar was blocked at BBW%ile=8. A base
+// building before a reversal is a low-volatility state by definition, so this
+// was vetoing the accumulation phase the strategy exists to buy.
+//
+// Kept as a dial rather than deleted, and WIRED — the filter had been removed
+// from the regime line while this Param stayed in the dialog, which is worse
+// than either choice on its own: a control that reads as active and does
+// nothing. Raise it only if dead-flat contracts start signalling.
+BBWLowPct  = Param("BBW Squeeze Percentile (0=off)", 0, 0, 40, 1);
+// 100 disables the cap. It was 90, which fought the setup: a bar that pierces
+// the lower band IS a volatility expansion, so BBW sits near its 100-bar high on
+// exactly the bars this strategy wants — the blow-off guard was blocking the
+// entry it was written to permit. 98 still stops a genuine gap-and-run
+// (results day, block deal) without vetoing every ordinary flush.
+BBWHighPct = Param("BBW Blowoff Percentile", 98, 60, 100, 1);
+
+NumPivots  = Param("Pivots To Scan For S/R", 10, 3, 20, 1);
+TouchScan  = Param("Bars To Scan For Touches", 40, 10, 120, 5);
+TouchTol   = Param("Touch Tolerance %", 0.5, 0.1, 2.0, 0.1);
+SLBufMajor = Param("SL Buffer ATR x (2+ touches)", 0.3, 0.1, 1.0, 0.05);
+SLBufMinor = Param("SL Buffer ATR x (1 touch)", 0.5, 0.1, 1.5, 0.05);
+SLFloorATR = Param("SL Min Distance ATR x", 1.0, 0.3, 2.0, 0.1);
+SLMaxATR   = Param("SL Max Distance ATR x", 3.0, 1.5, 6.0, 0.1);
+
+// 0 disables. The backend already gates on min_rr (default 1.5) and STORES a
+// rejected signal as LOW_RR so you can still see it, which is more useful than
+// making it vanish here. Raise this only if you want them gone at the source.
+MinRR = Param("Min R:R To Export (0=off)", 0, 0, 5, 0.1);
+
+// Export the ATR-buffered stop in the support column instead of the raw pivot
+// low. The backend uses support DIRECTLY as the Stop Loss, so exporting the raw
+// level would throw away the anti-stop-hunt buffer computed below.
+ExportBufferedStop = Param("Export Buffered Stop As Support", 1, 0, 1, 1);
+
+// Diagnostic mode: one row per symbol showing the state of every gate on the
+// last CLOSED bar, instead of only the symbols that signalled. A stack of
+// filters gives you no way to tell a strategy that is correctly waiting from one
+// that is silently broken, and "no rows" looks identical in both cases. Sort on
+// the "Blocked At" column to see where the universe is actually dying.
+//
+// The Analysis range still has to reach the closed bar — see the header. It said
+// "1 recent bar(s)" here, which pointed the whole diagnostic at the FORMING
+// candle: Buy is never set there, so the diagnostic reported on a partial bar
+// and normal mode returned nothing at all.
+DiagMode = Param("Diagnostic Mode", 0, 0, 1, 1);
+
+// 1 = only the newest closed candle. Raising it re-exports previous closed
+// candles so a bar missed while Amibroker or the bridge was down still reaches
+// the backend. Do that deliberately: a backfilled bar the server never saw is a
+// NEW signal, not a duplicate, so with Paper Trading on it will be auto-executed
+// at today's price on a setup that fired hours ago.
+backfillBars = Param("Backfill Bars", 1, 1, 10, 1);
+
+// ---- SECTION 3: CORE INDICATORS ------------------------------------------
+BBMid   = MA(Close, BBPeriod);
+BBSD    = StDev(Close, BBPeriod);
+BBUpper = BBMid + BBWidth * BBSD;
+BBLower = BBMid - BBWidth * BBSD;
+
+// Guard the divisor: on a limit-locked or totally flat series StDev is 0, the
+// bands collapse onto the mean, and %B becomes a division by zero that
+// propagates Null through every downstream filter and kills the signal silently.
+BandRange = BBUpper - BBLower;
+SafeBand  = Max(BandRange, 0.000001);
+PctB      = (Close - BBLower) / SafeBand;
+PctB      = IIf(BandRange > 0, PctB, 0.5);
+
+BBW       = BandRange / Max(BBMid, 0.000001);
+
+EMATrend  = EMA(Close, EMALen);
+
+// The EMA is no longer falling: it is at or above where it was EMASlopeLB bars
+// ago. Rounding matters here — on a slow-turning EMA the bar-to-bar change is
+// tiny, so a 1-bar slope is noise. EMASlopeLB bars is the smallest window that
+// distinguishes "basing" from "still dropping".
+EMAFlat   = EMATrend >= Ref(EMATrend, -EMASlopeLB);
+
+Uptrend   = Close > EMATrend;
+if (TrendMode == 1)
+    Uptrend = Close > EMATrend OR EMAFlat;
+if (TrendMode == 2)
+    Uptrend = 1 + 0 * Close;      // array, not scalar — it is ANDed with arrays
+
+RSIVal = RSI(RSIPeriod);
+MFIVal = MFI(MFIPeriod);
+ATRVal = ATR(ATRPeriod);
+
+// ---- SECTION 4: SWING-PIVOT SUPPORT / RESISTANCE -------------------------
+// A pivot is confirmed only PivotStrength bars AFTER it prints. Testing
+// Ref(High,-PS) against HHV(High, 2*PS+1) asks "was the bar PS back the highest
+// of the window centred on it" — the window is [t-2PS .. t], entirely in the
+// past, so this never repaints and never peeks forward.
+//
+// The source script used  High == HHV(High, 2*PS+1) AND Ref(High,-PS) < High,
+// which only says the CURRENT bar is the highest of the last 2*PS+1 — that is a
+// running high, not a pivot, and it marks a level that price has not yet turned
+// away from.
+PS      = PivotStrength;
+PWin    = 2 * PS + 1;
+
+PivotHi    = Ref(High, -PS) == HHV(High, PWin);
+PivotLo    = Ref(Low, -PS) == LLV(Low, PWin);
+PivotHiVal = Ref(High, -PS);
+PivotLoVal = Ref(Low, -PS);
+
+// Nearest support BELOW price and nearest resistance ABOVE it, scanned over the
+// last NumPivots confirmed pivots.
+//
+// Seeded with 0 / BigNum, NOT Null. Null in AFL is a NaN and every comparison
+// against it is false, so the source script's  SL > NearestSupport  could never
+// once be true and NearestSupport stayed Null for the entire run — no support
+// was ever found. Seeding with real numbers is what makes the comparison work.
+BigNum = 100000000;
+
+NearSup = 0 * Close;                 // zero-filled ARRAY (0*Close, not 0, so it
+NearRes = BigNum + 0 * Close;        // is an array and not a scalar)
+SecSup  = 0 * Close;
+SecRes  = BigNum + 0 * Close;
+
+for (p = 1; p <= NumPivots; p++)
+{
+    // ValueWhen(..., p) = the value at the p-th most recent bar where the pivot
+    // was confirmed. The source used Ref(ValueWhen(...), -p+1), which steps back
+    // p BARS rather than p PIVOTS — on a quiet stretch that is the same pivot
+    // ten times over.
+    lv = ValueWhen(PivotLo, PivotLoVal, p);
+    hv = ValueWhen(PivotHi, PivotHiVal, p);
+
+    // highest pivot low that is still below price
+    NearSup = IIf(lv < Close AND lv > NearSup, lv, NearSup);
+    // lowest pivot high that is still above price
+    NearRes = IIf(hv > Close AND hv < NearRes, hv, NearRes);
+}
+
+for (p = 1; p <= NumPivots; p++)
+{
+    lv = ValueWhen(PivotLo, PivotLoVal, p);
+    hv = ValueWhen(PivotHi, PivotHiVal, p);
+
+    SecSup = IIf(lv < NearSup AND lv > SecSup, lv, SecSup);
+    SecRes = IIf(hv > NearRes AND hv < SecRes, hv, SecRes);
+}
+
+HasSup = NearSup > 0;
+HasRes = NearRes < BigNum;
+
+// ---- touch counting ------------------------------------------------------
+// A level price has tested twice is a validated level; one it touched once is a
+// guess. The count only decides how much ATR buffer the stop needs, so scanning
+// TouchScan bars rather than the full S/R lookback is a deliberate trade of a
+// little accuracy for a lot of Exploration speed across a few hundred symbols.
+TolFrac = TouchTol / 100;
+
+SupTouch = 0 * Close;
+ResTouch = 0 * Close;
+
+for (k = 1; k <= TouchScan; k++)
+{
+    pLow  = Ref(Low, -k);
+    pHigh = Ref(High, -k);
+
+    SupTouch = SupTouch + IIf(HasSup AND pLow <= NearSup * (1 + TolFrac)
+                                     AND pLow >= NearSup * (1 - TolFrac), 1, 0);
+    ResTouch = ResTouch + IIf(HasRes AND pHigh >= NearRes * (1 - TolFrac)
+                                     AND pHigh <= NearRes * (1 + TolFrac), 1, 0);
+}
+
+// ---- SECTION 5: ENTRY FILTERS — TWO CORE, FIVE SCORED (RELAXED) ----------
+// F1 and F3 are CORE and mandatory. F2, F4, F5, F6, F7 are corroboration and are
+// counted, not ANDed — see the MinConfirm dial and the scoring block below.
+//
+// F1 TREND — only buy above the long EMA (CORE). A lower-band touch in a
+//    downtrend is just price riding the band down.
+// (Uptrend computed above.)
+
+// F2 W-BOTTOM — price closed below the lower band somewhere in the lookback and
+//    is now back above it: the dip has a base behind it, not just one bar.
+//    Compares each bar's close to its own contemporaneous band (more accurate
+//    than pinning to a single historical band value).
+WasBelow  = LLV(Close - BBLower, WBottomLB) < 0;
+NowAbove  = Close > BBLower;
+WBottom   = WasBelow AND NowAbove;
+
+// F3 BAND REJECTION — price went below the band within the last PokeLB bars and
+//    is now back inside it but not yet extended. This plus F1 is the whole
+//    strategy; everything else only corroborates it.
+//
+//    The poke used to have to be on EXACTLY the previous bar. That is the single
+//    tightest constraint in the file after the trend: on 4H a base pokes under
+//    the band, chops sideways for two or three bars, and only then turns, and
+//    demanding the reversal on the very next candle discards most real bottoms.
+//    Widening the window to PokeLB bars does not weaken the setup — the
+//    confirmations still have to land on the reversal bar itself, so all this
+//    changes is how long the poke stays valid while we wait for that bar.
+//
+//    Ref(..., -1), negative. Both source scripts wrote Ref(PctB, 1), and a
+//    POSITIVE offset in AFL reads the NEXT bar — the rule was being evaluated
+//    against a bar that has not happened yet. It backtests beautifully and
+//    cannot be traded, and on a live Exploration the last bar has no future to
+//    read so the signal silently changes as soon as one more bar arrives.
+BelowBand = Close < BBLower;                 // TouchMode 0: needs a CLOSE under
+if (TouchMode == 1)
+    BelowBand = Low < BBLower;               // TouchMode 1: a wick is enough
+
+// Ref(..., -1) so the poke is at or before the PREVIOUS bar — the current bar is
+// the recovery and must not be counted as its own trigger.
+Poked     = Sum(IIf(BelowBand, 1, 0), PokeLB) > 0;
+PctBWas   = Ref(Poked, -1);
+
+PctBNow   = PctB > PctBOversold AND PctB < PctBRecover;
+PctBSig   = PctBWas AND PctBNow;
+
+// F4 RSI — was oversold within the last 3 bars and is turning up on this one.
+//    The old form demanded oversold on EXACTLY the previous bar, which missed
+//    bases that flushed 2-3 bars before reversing.
+RSISig = LLV(RSIVal, 3) < RSILevel AND RSIVal > Ref(RSIVal, -1);
+
+// F5 MFI — the volume-weighted twin of F4: real money was leaving and has
+//    started to come back. Same 3-bar window reasoning.
+MFISig = LLV(MFIVal, 3) < MFILevel AND MFIVal > Ref(MFIVal, -1);
+
+// F6 CANDLE — the entry bar itself must show buying, with a real body OR a
+//    bullish hammer (long lower shadow, small body near the high). Hammers are
+//    common at bottoms and the old body-only filter rejected them.
+Rng       = High - Low;
+SafeRng   = Max(Rng, 0.000001);
+BodyRatio = abs(Close - Open) / SafeRng;
+BodyRatio = IIf(Rng > 0, BodyRatio, 0);
+
+LowerWick   = IIf(Close > Open, Open - Low, Close - Low);
+Hammer      = LowerWick > 0.60 * SafeRng AND Close > Open;
+ValidCandle = (Close > Open AND BodyRatio > BodyMin) OR Hammer;
+
+// F7 VOLUME — some participation on the reversal bar. Accept either a volume
+//    spike vs the previous bar OR at least VolFactor of the 20-bar average.
+//
+//    Be aware of what this costs: "up on the previous bar" is true about half
+//    the time on its own and "above half the average" about three quarters of
+//    the time, so the OR is true on roughly 85–90% of bars. F7 is very nearly a
+//    free point, which makes MinConfirm=3 of 5 behave closer to 2 of 4. That is
+//    a deliberate loosening, not a bug — but if the signals come out noisy, this
+//    is the one to tighten first (drop the OR, or raise VolFactor), before
+//    touching anything in the core.
+AvgVol     = MA(Volume, 20);
+VolConfirm = Volume > Ref(Volume, -1) OR Volume > VolFactor * AvgVol;
+
+// ---- regime filter -------------------------------------------------------
+// Only genuine blow-offs are blocked by default. A squeeze / low-volatility base
+// is exactly the accumulation phase this mean-reversion strategy exists to buy,
+// so the lower bound is off unless BBWLowPct is raised above 0.
+BBWPct  = PercentRank(BBW, 100);
+NoTrade = BBWPct > BBWHighPct;
+if (BBWLowPct > 0)
+    NoTrade = NoTrade OR BBWPct < BBWLowPct;
+
+// CORE — mandatory, and between them they are the strategy: buy a rejection of
+// the lower band, but only on the right side of the trend. No amount of
+// corroboration substitutes for either, so these are never scored.
+CoreSetup = Uptrend AND PctBSig;
+
+// CONFIRMATIONS — scored, not ANDed. Each is a roughly-30% condition and they
+// are close to independent, so demanding all five was a ~0.2% event on top of an
+// already-rare core. MinConfirm=5 restores the old all-or-nothing behaviour.
+ConfirmCount = IIf(WBottom, 1, 0) + IIf(RSISig, 1, 0) + IIf(MFISig, 1, 0)
+             + IIf(ValidCandle, 1, 0) + IIf(VolConfirm, 1, 0);
+
+// The regime block stays hard rather than joining the vote: a genuine blow-off
+// keeps expanding ahead of price, and that is not a matter of degree.
+//
+// Kept separately from RawBuy so the diagnostic can tell "the filters never
+// lined up" apart from "they did, but the R:R or the anti-repeat gate suppressed
+// it" — two very different problems that look the same from outside.
+FiltersPass = CoreSetup AND ConfirmCount >= MinConfirm AND NOT NoTrade;
+
+RawBuy = FiltersPass;
+
+// ---- SECTION 6: S/R-AWARE STOP AND TARGET --------------------------------
+// A validated support (2+ touches) needs less room than a single-touch one.
+MajorSup = HasSup AND SupTouch >= 2;
+
+SLBuf   = IIf(MajorSup, SLBufMajor, SLBufMinor);
+SLFromSup = NearSup - SLBuf * ATRVal;
+
+SLFloor = Close - SLFloorATR * ATRVal;   // never risk LESS than this
+SLMax   = Close - SLMaxATR * ATRVal;     // never risk MORE than this
+SLFromBB = BBLower - SLBufMinor * ATRVal;
+
+// Prefer the pivot support; fall back to the band; floor on ATR.
+FinalSL = IIf(HasSup AND SLFromSup < Close, SLFromSup,
+           IIf(SLFromBB < Close, SLFromBB, SLFloor));
+
+// Clamp into [SLMax, SLFloor]: too far away and the R:R is fiction, too close
+// and normal noise takes you out.
+FinalSL = Max(FinalSL, SLMax);
+FinalSL = Min(FinalSL, SLFloor);
+
+// Target = nearest resistance, but only if it is far enough away to be worth
+// the trip; otherwise reach for the upper band.
+TgtFromRes = NearRes;
+TooClose   = HasRes AND (NearRes - Close) < ATRVal;
+FinalTgt   = IIf(HasRes AND NOT TooClose, TgtFromRes, BBUpper);
+FinalTgt   = IIf(FinalTgt > Close, FinalTgt, BBUpper);
+
+RiskPts = Close - FinalSL;
+RewPts  = FinalTgt - Close;
+SafeRisk = Max(RiskPts, 0.000001);
+RRVal   = RewPts / SafeRisk;
+RRVal   = IIf(RiskPts > 0, RRVal, 0);
+
+RROK = 1;
+if (MinRR > 0)
+    RROK = RRVal >= MinRR;
+
+RawBuy = RawBuy AND RiskPts > 0 AND RROK;
+
+// ---- SECTION 7: EXIT SIGNAL ----------------------------------------------
+// SELL is an EXIT here, never a short entry — the backend treats it that way and
+// attaches no entry levels to it. The backend owns Target/SL/trailing, so this
+// is only an advisory "the mean reversion is done".
+//
+// These are CROSSES, not levels. Written as levels —  PctB > 0.85 OR RSI > 70 —
+// the condition stays true for every bar of a rally, so a single move up the
+// band painted a red arrow on twenty consecutive bars and posted twenty SELL
+// rows to the backend. Cross() fires only on the bar the threshold is breached.
+RawSell = Cross(Close, BBUpper) OR Cross(PctB, 0.85) OR Cross(RSIVal, 70);
+
+// ---- SECTION 8: CLOSED CANDLES ONLY --------------------------------------
+// During the session BarCount-1 is the candle still FORMING. Reading it means
+// the rule is evaluated on a partial bar and can un-fire before the bar closes.
+// So step back one bar and act only on a candle that can no longer change.
+lastBar = BarCount - 1;
+while (lastBar > 0 AND Volume[lastBar] == 0)
+    lastBar = lastBar - 1;      // skip zero-volume pad bars from "Pad & align"
+
+lastClosed = lastBar - 1;
+while (lastClosed > 0 AND Volume[lastClosed] == 0)
+    lastClosed = lastClosed - 1;
+
+firstClosed = lastClosed - (backfillBars - 1);
+if (firstClosed < 0)
+    firstClosed = 0;
+
+// A per-bar flag for "this is the newest closed candle". The Exploration uses it
+// to put its row on the bar the strategy was actually evaluated on. Without it
+// the only way to select a bar is the Analysis range, and the range's own last
+// bar is the FORMING candle — where Buy is 0 by construction and every indicator
+// is reading a partial bar.
+EvalBar = 0 * Close;
+if (lastClosed >= 0)
+    EvalBar[lastClosed] = 1;
+
+// ---- SECTION 9: ANTI-REPEAT GATE -----------------------------------------
+// The loophole: every one of the seven filters can stay true for several bars
+// running, so one dip emits a BUY on bar after bar and the backend sees a
+// cluster of near-identical signals a few rupees apart.
+//
+// ExRem cannot fix this. It only alternates BUY against SELL, so two BUYs with
+// no SELL between them still both survive — which is exactly this case.
+//
+// Three conditions, and this is deliberately path-dependent state, so it needs a
+// bar loop rather than an array expression:
+//
+//   1. COOLDOWN  — at least MinBarsBetween bars since the last accepted signal.
+//   2. RE-ARM    — %B climbed back to PctBRearm (price returned to the middle
+//                  band) since the last signal, meaning the move completed and
+//                  this is a genuinely new setup rather than the same dip.
+//   3. PRICE GAP — if it has NOT re-armed, the new signal must be at least
+//                  MinGapPct BELOW the last one. That is the averaging-down
+//                  case: still the same dip, but meaningfully cheaper, which is
+//                  the only reason to add.
+//
+// A percentage gate alone is not enough, since a sharp drop clears 3% in two
+// daily bars while still being one continuous move — which is why the cooldown
+// and the re-arm are there too.
+// SELL is gated in the SAME loop, because an exit only means anything after an
+// entry. haveBuy makes the two strictly alternate — one SELL per BUY, and never
+// a SELL for a position this strategy never opened. Without it a stock that
+// simply rallied all year emitted a stream of exits against nothing.
+BuyFinal  = 0 * Close;     // zero-filled arrays, not scalars
+SellFinal = 0 * Close;
+
+lastPx  = 0;
+lastIdx = -100000;
+armed   = 1;               // first signal is always allowed to fire
+haveBuy = 0;               // no open entry from this strategy yet
+
+for (i = 0; i <= lastClosed; i++)
+{
+    if (PctB[i] >= PctBRearm)
+        armed = 1;         // price came back to the mean — setup has reset
+
+    fired = 0;
+
+    if (RawBuy[i])
+    {
+        okBars = (i - lastIdx) >= MinBarsBetween;
+
+        okGap = 0;
+        if (armed)
+            okGap = 1;                       // fresh setup
+        if (lastPx <= 0)
+            okGap = 1;                       // nothing to compare against yet
+        if (lastPx > 0)
+        {
+            dropPct = (lastPx - Close[i]) / lastPx * 100;
+            if (dropPct >= MinGapPct)
+                okGap = 1;                   // same dip but materially cheaper
+        }
+
+        if (okBars AND okGap)
+        {
+            BuyFinal[i] = 1;
+            lastPx  = Close[i];
+            lastIdx = i;
+            armed   = 0;
+            haveBuy = 1;
+            fired   = 1;
+        }
+    }
+
+    // BUY wins a bar that carries both, matching the CSV writer below.
+    if (fired == 0 AND RawSell[i] AND haveBuy == 1)
+    {
+        SellFinal[i] = 1;
+        haveBuy = 0;
+    }
+}
+
+Buy  = BuyFinal;
+Sell = SellFinal;
+
+// ---- lifetime gate counters ----------------------------------------------
+// Running totals over this symbol's WHOLE history, read on the last bar. This is
+// the only diagnostic that separates "the setup did not happen today" from "this
+// formula has never been capable of firing" — a per-bar pass/fail column looks
+// identical in both cases, which is what made the last round of debugging guess-
+// work. A symbol showing 60 core setups and 0 signals is a tuning problem; one
+// showing 0 core setups in three years of bars is a logic problem.
+EverCore    = Cum(IIf(CoreSetup, 1, 0));
+EverPass    = Cum(IIf(FiltersPass, 1, 0));
+EverRawBuy  = Cum(IIf(RawBuy, 1, 0));
+EverBuy     = Cum(IIf(Buy, 1, 0));
+EverTrend   = Cum(IIf(Uptrend, 1, 0));
+EverPctB    = Cum(IIf(PctBSig, 1, 0));
+EverRegime  = Cum(IIf(NoTrade, 1, 0));
+
+// ---- SECTION 10: CSV EXPORT ----------------------------------------------
+// ONE file per timeframe, append-only. 1D -> scan_1440.csv.
+//
+// This file is a QUEUE, not a snapshot. Every symbol only ever APPENDS and the
+// bridge empties it once it has delivered what it read. Nothing here truncates:
+// Explorations are multi-threaded, and a truncate races with other symbols'
+// appends and erases their rows.
+//
+// Each symbol builds its whole output first and writes it with a single fputs,
+// so one symbol's rows cannot interleave with another's mid-line.
+//
+// Headerless and POSITIONAL — COLUMNS in scan_bridge.py is the contract:
+//     symbol, timeframe_min, action, price, atr, resistance, bar_time, support
+// New columns go at the END or every existing row is reinterpreted. Note that
+// bar_time sits BEFORE support; that order is not negotiable.
+tfStr   = StrFormat("%.0f", TF_MIN);
+csvPath = "C:\\swing\\scan_" + tfStr + ".csv";
+
+out = "";
+
+yy = Year();  mo = Month();  dd = Day();
+hh = Hour();  mm = Minute(); ss = Second();
+
+// resistance -> Target, support -> Stop. Exporting the buffered stop keeps the
+// anti-stop-hunt distance; exporting 0 makes the backend fall back to ATR.
+ExpSup = FinalSL;
+if (ExportBufferedStop == 0)
+    ExpSup = NearSup;
+
+ExpRes = FinalTgt;
+
+if (TF_OK AND lastClosed >= 0)
+{
+    for (i = firstClosed; i <= lastClosed; i++)
+    {
+        if (Volume[i] > 0)
+        {
+            act = "";
+            if (Sell[i])
+                act = "SELL";
+            if (Buy[i])
+                act = "BUY";      // BUY wins if a bar somehow carries both
+
+            if (StrLen(act) > 0)
+            {
+                barTime = StrFormat("%04.0f-%02.0f-%02.0fT%02.0f:%02.0f:%02.0f",
+                                    yy[i], mo[i], dd[i], hh[i], mm[i], ss[i]);
+
+                sOut = ExpSup[i];
+                rOut = ExpRes[i];
+
+                // Never export a level on the wrong side of the entry: the
+                // backend would read an "above" stop or a "below" target and
+                // compute a negative R:R. 0 tells it to fall back to ATR.
+                if (sOut >= Close[i])
+                    sOut = 0;
+                if (rOut <= Close[i])
+                    rOut = 0;
+
+                out = out + Name() + "," +
+                      tfStr + "," +
+                      act + "," +
+                      StrFormat("%.2f", Close[i]) + "," +
+                      StrFormat("%.2f", ATRVal[i]) + "," +
+                      StrFormat("%.2f", rOut) + "," +
+                      barTime + "," +
+                      StrFormat("%.2f", sOut) + "\n";
+            }
+        }
+    }
+}
+
+// Only touch the file when this symbol actually has something to say — a scan of
+// 200 symbols with two signals opens the file twice, not 200 times.
+if (StrLen(out) > 0)
+{
+    fh = fopen(csvPath, "a");
+    if (fh)
+    {
+        fputs(out, fh);
+        fclose(fh);
+    }
+}
+
+// ---- SECTION 11: EXPLORATION COLUMNS -------------------------------------
+// Normal mode lists only what signalled. Diagnostic mode lists EVERY symbol with
+// the state of each gate, which is the only way to find out why a scan is quiet.
+//
+// Diagnostic mode anchors to the last CLOSED bar. It was  Filter = 1, which
+// emitted a row for every bar in the range and left you reading whichever one
+// the range happened to end on — the forming candle, where Buy is never set and
+// every indicator is mid-formation.
+//
+// Normal mode stays  Buy OR Sell  so that running it over a long range still
+// lists historical signals for research. But the range must reach the last
+// CLOSED bar — n >= backfillBars + 2 — because Buy is 0 on the forming one, so a
+// 1-bar range returned an empty Exploration unconditionally, which is
+// indistinguishable from "the strategy found nothing".
+if (DiagMode == 1)
+    Filter = EvalBar;          // exactly one row per symbol
+else
+    Filter = Buy OR Sell;
+
+AddTextColumn(WriteIf(Buy, "BUY", WriteIf(Sell, "SELL", "")), "Signal");
+AddColumn(DateTime(), "Bar", formatDateTime);   // which candle this row is
+AddColumn(Close, "Price", 1.2);
+AddColumn(ExpRes, "Target (Res)", 1.2);
+AddColumn(ExpSup, "Stop (Sup)", 1.2);
+AddColumn(RRVal, "R:R", 1.2);
+
+if (DiagMode == 1)
+{
+    // The one column worth sorting on. Every symbol dies at exactly one gate, so
+    // sorting this gives a histogram of where the universe is stuck — and the
+    // numeric prefix makes the sort follow the order the gates are applied in.
+    // "core: below EMA" across the whole list means the trend filter is the
+    // problem; "too few confirms" means it is genuinely just waiting.
+    AddTextColumn(
+        WriteIf(NOT Uptrend,     "1 core: below EMA",
+        WriteIf(NOT PctBSig,     "2 core: no band reject",
+        WriteIf(NoTrade,         "3 regime: BBW",
+        WriteIf(NOT FiltersPass, "4 too few confirms",
+        WriteIf(NOT RawBuy,      "5 R:R / risk<=0",
+        WriteIf(NOT Buy,         "6 anti-repeat", "** SIGNAL **")))))), "Blocked At");
+
+    // 5 = every confirmation passed. Read against MinConfirm.
+    AddColumn(ConfirmCount, "Confirms /5", 1.0);
+
+    // Lifetime counts, and the columns to read FIRST. Run this over "All
+    // quotations" and scan down "Ever Core": if it is 0 for every symbol in the
+    // universe then no amount of loosening the confirmations will help, because
+    // the trend + band-rejection pair never coincides — that is a geometry
+    // problem (the lower band has to sit above the trend EMA for both to be true
+    // at once) and TrendMode is the lever, not MinConfirm.
+    AddColumn(EverTrend,  "Ever Trend", 1.0);
+    AddColumn(EverPctB,   "Ever %B", 1.0);
+    AddColumn(EverCore,   "Ever Core", 1.0);
+    AddColumn(EverRegime, "Ever BBWblk", 1.0);
+    AddColumn(EverPass,   "Ever Pass", 1.0);
+    AddColumn(EverRawBuy, "Ever RawBuy", 1.0);
+    AddColumn(EverBuy,    "Ever BUY", 1.0);
+
+    AddTextColumn(WriteIf(Uptrend,     "CORE ok", "-- Close<EMA"), "F1 Trend");
+    AddTextColumn(WriteIf(PctBSig,     "CORE ok", "-- no %B x"),   "F3 %B");
+    AddTextColumn(WriteIf(WBottom,     "OK", "-- no W"),      "F2 WBottom");
+    AddTextColumn(WriteIf(RSISig,      "OK", "-- RSI"),       "F4 RSI");
+    AddTextColumn(WriteIf(MFISig,      "OK", "-- MFI"),       "F5 MFI");
+    AddTextColumn(WriteIf(ValidCandle, "OK", "-- candle"),    "F6 Candle");
+    AddTextColumn(WriteIf(VolConfirm,  "OK", "-- volume"),    "F7 Volume");
+    AddTextColumn(WriteIf(NoTrade,     "BLOCKED", "ok"),      "BBW Regime");
+
+    // Separates "filters never aligned" from "they did, but a later gate ate it".
+    AddTextColumn(WriteIf(FiltersPass, "YES", "no"), "Core+Confirms");
+    AddTextColumn(WriteIf(RawBuy, "YES", "no"),      "After R:R");
+    AddTextColumn(WriteIf(Buy, "YES", "no"),         "After Anti-Rpt");
+
+    // The trend EMA needs EMALen bars of history and PercentRank needs 100. A
+    // contract that has not lived that long returns Null here, Uptrend is false
+    // on every bar, and the scan goes silent with no error anywhere. Compare
+    // "Bars Avail" against EMALen before blaming the strategy — on daily, EMALen
+    // bars is EMALen trading sessions of history in the database.
+    AddColumn(BarCount, "Bars Avail", 1.0);
+    AddColumn(EMALen + 0 * Close, "Bars Needed", 1.0);
+    AddColumn(EMATrend, "EMA Trend", 1.2);
+    AddColumn(Ref(PctB, -1), "Prev %B", 1.3);
+}
+
+AddColumn(NearSup, "Raw Support", 1.2);
+AddColumn(NearRes, "Raw Resistance", 1.2);
+AddColumn(SupTouch, "S Touches", 1.0);
+AddColumn(ResTouch, "R Touches", 1.0);
+AddColumn(PctB, "%B", 1.3);
+AddColumn(RSIVal, "RSI", 1.1);
+AddColumn(MFIVal, "MFI", 1.1);
+AddColumn(ATRVal, "ATR", 1.2);
+AddColumn(BBWPct, "BBW %ile", 1.0);
+AddTextColumn(WriteIf(TF_OK, "", "WRONG TIMEFRAME - NOT EXPORTED"), "TF Check");
+
+// ---- SECTION 12: CHART PLOTTING ------------------------------------------
+// NOT wrapped in a Status("action") test. AmiBroker already ignores Plot() while
+// running an Exploration, so guarding it bought nothing — and the guard stopped
+// the bands from ever drawing on a chart, which is the whole point of looking at
+// one. Plot unconditionally.
+// Price FIRST, as candles, so the bands and levels draw on top of it. A formula
+// that calls Plot() at all replaces the chart's own price plot, so without this
+// line there are no candles on the chart — only the indicator lines.
+SetChartOptions(0, chartShowArrows | chartShowDates);
+Plot(Close, "Price", colorDefault, styleCandle);
+
+Plot(BBUpper, "BB Upper", colorLightGrey, styleLine | styleThick);
+Plot(BBMid,   "BB Mid",   colorBlue,      styleLine);
+Plot(BBLower, "BB Lower", colorLightGrey, styleLine | styleThick);
+Plot(EMATrend, "EMA " + NumToStr(EMALen, 1.0), colorOrange, styleLine | styleThick);
+
+Plot(IIf(HasSup, NearSup, Null), "Support",    colorGreen,  styleLine | styleNoRescale);
+Plot(IIf(HasRes, NearRes, Null), "Resistance", colorRed,    styleLine | styleNoRescale);
+Plot(IIf(Buy, FinalSL, Null),    "Stop",       colorYellow, styleDashed | styleNoRescale);
+
+PlotShapes(IIf(Buy, shapeUpArrow, shapeNone), colorBrightGreen, 0, Low, -30);
+PlotShapes(IIf(Sell, shapeDownArrow, shapeNone), colorRed, 0, High, -30);
+PlotShapes(IIf(PivotLo, shapeSmallCircle, shapeNone), colorGreen, 0, PivotLoVal, 0);
+PlotShapes(IIf(PivotHi, shapeSmallCircle, shapeNone), colorRed,   0, PivotHiVal, 0);
+
+// An explicit Title, so the legend names every filter's state on the hovered bar
+// rather than leaving you to guess why a bar did not signal.
+Title = Name() + "  " + Date() + "   C=" + NumToStr(Close, 1.2)
+      + "   BB " + NumToStr(BBLower, 1.2) + " / " + NumToStr(BBMid, 1.2)
+      + " / " + NumToStr(BBUpper, 1.2)
+      + "\n%B=" + NumToStr(PctB, 1.3)
+      + "  RSI=" + NumToStr(RSIVal, 1.1)
+      + "  MFI=" + NumToStr(MFIVal, 1.1)
+      + "  ATR=" + NumToStr(ATRVal, 1.2)
+      + "  BBW%ile=" + NumToStr(BBWPct, 1.0)
+      + "\nConfirms " + NumToStr(ConfirmCount, 1.0) + "/5 (need "
+      + NumToStr(MinConfirm, 1.0) + ")   "
+      + WriteIf(Uptrend, "trend ", "TREND ")
+      + WriteIf(PctBSig, "pctb ", "PCTB ")
+      + WriteIf(WBottom, "wbot ", "WBOT ")
+      + WriteIf(RSISig, "rsi ", "RSI ")
+      + WriteIf(MFISig, "mfi ", "MFI ")
+      + WriteIf(ValidCandle, "candle ", "CANDLE ")
+      + WriteIf(VolConfirm, "vol ", "VOL ")
+      + WriteIf(NoTrade, "  [BBW BLOCKED]", "")
+      // Lifetime totals up to the hovered bar. "no arrows on the chart" and
+      // "this formula can never fire" look the same until you can see these.
+      + "\nEver: trend " + NumToStr(EverTrend, 1.0)
+      + " | %B " + NumToStr(EverPctB, 1.0)
+      + " | CORE " + NumToStr(EverCore, 1.0)
+      + " | pass " + NumToStr(EverPass, 1.0)
+      + " | BUY " + NumToStr(EverBuy, 1.0)
+      + "   of " + NumToStr(BarCount, 1.0) + " bars";
+
+_SECTION_END();

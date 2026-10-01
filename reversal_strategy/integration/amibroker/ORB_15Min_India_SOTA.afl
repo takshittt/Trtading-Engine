@@ -1,0 +1,691 @@
+/*====================================================================================
+  ORB SOTA — Opening Range Breakout | NSE 15-Minute | Amibroker AFL
+  -----------------------------------------------------------------------------------
+  Design intent unchanged from v2.0: close-based breakout, VWAP direction, daily
+  trend alignment, body quality, volume, OR/ATR normalisation, confluence score,
+  pullback re-entry, timed exit.
+
+  v2.1 — CORRECTNESS PASS. v2.0 could not compile: nine constructs were not AFL.
+  Every fix is marked [FIX] at the point it applies. Summary:
+
+    1. LongScore / ShortScore / reEntryArmed / reEntryCount / NiftyUp / NiftyDown
+       were declared as bare scalars (`= 0`) and then subscripted (`[i]`).
+       Subscripting a scalar is a hard error. Output series are now arrays and
+       loop state is now genuinely scalar — the two were being conflated.
+    2. Re-entry state was written to bar i and read back at bar i, so it never
+       survived to the next bar. The entire re-entry path was dead code.
+    3. TimeFrameSet("daily") / TimeFrameExpand(x, "daily") — these take a numeric
+       interval, not a string. Now inDaily.
+    4. ApplyStop("sloss", 1, LongSL, ...) — the first argument is a numeric type
+       constant, not a string, and mode 1 (stopModePoint) wants a DISTANCE, not
+       an absolute price level. Both were wrong; there is also no per-direction
+       ApplyStop, so 1 and 2 were not doing what the code assumed.
+    5. VLine() does not exist in AFL.
+    6. PlotText() was passed IIf() over string literals (IIf is numeric only) and
+       an array for its y coordinate (must be a scalar).
+    7. `&` and `<<` — AFL has no bitwise-AND or shift operator, so the
+       day-of-week bitmask could not work. Replaced with explicit per-day flags.
+       (The default 124 was wrong anyway: it cleared Monday and set Saturday.)
+    8. VWAP used Sum(array, BarsSince(...)) — a variable period. Rebuilt on Cum().
+    9. Sell/Cover only ever fired on the entry bar itself, so a position was
+       never actually closed by its stop or target. Exits now run in the loop.
+
+  Also corrected, behaviourally:
+    - Score awarded a point for every DISABLED filter, so switching filters off
+      manufactured confluence and made MinScore trivially reachable.
+    - Score was documented as 0-10 but only nine components existed, two of which
+      (volume, OR/ATR) were already hard gates and could never score 0.
+    - A missing Nifty symbol silently blocked every signal.
+
+  USAGE
+    Interval       : 15-minute.
+    Analysis range : "All quotations", or "n last quotations" with n >= 30.
+                     Signals are written on CLOSED bars only.
+    Auto-repeat    : 1-2 minutes.
+    DiagMode=1     : one row per symbol on the last closed bar, with the gate
+                     that blocked it.
+====================================================================================*/
+
+_SECTION_BEGIN("ORB_SOTA_15Min_India");
+
+// ============================================================================
+// SECTION 1: PARAMETERS
+// ============================================================================
+TF_MIN = Interval() / 60;
+TF_OK  = TF_MIN == 15;
+
+TradeDir = Param("Trade Direction (0=Long 1=Short 2=Both)", 2, 0, 2, 1);
+EnableBT = Param("Enable Backtesting (1=yes)", 0, 0, 1, 1);
+
+// 1 = 09:15-09:30, 2 = 09:15-09:45.
+ORBars    = Param("OR Bars (1=15min 2=30min)", 1, 1, 4, 1);
+BufPct    = Param("Breakout Buffer %", 0.10, 0.0, 1.0, 0.05);
+EntryType = Param("Entry Type (0=Close 1=Wick)", 0, 0, 1, 1);
+
+MinORPct = Param("Min OR Range %", 0.30, 0.1, 2.0, 0.1);
+MaxORPct = Param("Max OR Range %", 3.00, 1.0, 8.0, 0.25);
+MinORATR = Param("Min OR/ATR Ratio", 0.40, 0.1, 1.0, 0.05);
+MaxORATR = Param("Max OR/ATR Ratio", 1.80, 1.0, 3.0, 0.1);
+
+VolMult     = Param("Volume Multiplier vs Avg", 1.5, 1.0, 5.0, 0.1);
+VolMAPeriod = Param("Volume MA Period", 10, 5, 30, 1);
+
+MinBodyPct   = Param("Min Body % of Candle Range", 50, 20, 80, 5);
+MinBodyORPct = Param("Min Body % of OR Range", 30, 10, 60, 5);
+
+UseVWAP        = Param("Use VWAP Filter (1=yes)", 1, 0, 1, 1);
+TrendEMAPeriod = Param("Intraday Trend EMA Period", 20, 10, 50, 1);
+UseTrend       = Param("Use Intraday Trend Filter (1=yes)", 1, 0, 1, 1);
+
+UseDailyEMA  = Param("Use Daily 200 EMA Filter (1=yes)", 1, 0, 1, 1);
+DailyEMALen  = Param("Daily EMA Length", 200, 20, 300, 10);
+UseDailyADX  = Param("Use Daily ADX Filter (1=yes)", 1, 0, 1, 1);
+MinADX       = Param("Min Daily ADX", 25, 15, 40, 1);
+UseNR7       = Param("Use NR7 Boost (1=yes)", 1, 0, 1, 1);
+UseSIP       = Param("Use Stock-in-Play Filter (1=yes)", 1, 0, 1, 1);
+SIPVolMult   = Param("SIP Volume Multiplier (prev day)", 1.5, 1.0, 3.0, 0.1);
+
+UseNiftyFilter = Param("Use Nifty Direction Filter (1=yes)", 1, 0, 1, 1);
+NiftySymbol    = ParamStr("Nifty Symbol", "NIFTY");
+NiftyEMALen    = Param("Nifty Daily EMA Length", 20, 5, 100, 1);
+
+MaxGapPct = Param("Max Gap % from Prev Close", 0.80, 0.5, 5.0, 0.1);
+UseGap    = Param("Use Gap Filter (1=yes)", 1, 0, 1, 1);
+
+// [FIX] Explicit per-day flags. The bitmask needed `&` and `<<`, neither of
+// which exists in AFL, so DOWOK evaluated to garbage. IntradayLab's Nifty study
+// is the reason this is here at all — Tue was the weak day — so Tue is the one
+// worth being able to switch off on its own.
+UseDOW = Param("Use Day-of-Week Filter (1=yes)", 1, 0, 1, 1);
+AllowMon = Param("Allow Monday", 1, 0, 1, 1);
+AllowTue = Param("Allow Tuesday", 1, 0, 1, 1);
+AllowWed = Param("Allow Wednesday", 1, 0, 1, 1);
+AllowThu = Param("Allow Thursday", 1, 0, 1, 1);
+AllowFri = Param("Allow Friday", 1, 0, 1, 1);
+
+CutoffTime    = Param("No Entry After (HHMMSS)", 113000, 93000, 153000, 1000);
+ForceExitTime = Param("Force Exit Time (HHMMSS)", 151500, 140000, 153000, 1000);
+
+// [FIX] Percentage, not an absolute count. The old MinScore was compared against
+// a total that shrank whenever a filter was switched off — so disabling filters
+// either made the gate unreachable or (as it actually behaved, since disabled
+// filters scored a point) made it free. A percentage of the ENABLED filters is
+// the only form that stays meaningful as you toggle them.
+MinScorePct  = Param("Min Confluence %", 65, 0, 100, 5);
+FullSizePct  = Param("Full Size Confluence %", 85, 50, 100, 5);
+
+EnableReEntry = Param("Enable Re-Entry on Pullback (1=yes)", 1, 0, 1, 1);
+ReEntryBars   = Param("Max Bars to Wait for Re-Entry", 5, 2, 10, 1);
+ReEntryTol    = Param("Re-Entry Tolerance %", 0.20, 0.05, 0.50, 0.05);
+
+ATRPeriod  = Param("ATR Period", 14, 5, 30, 1);
+MaxRiskPct = Param("Max OR Risk % of Open", 1.0, 0.3, 3.0, 0.1);
+
+Tgt1Mult = Param("Target 1 (x OR)", 1.0, 0.5, 2.0, 0.1);
+Tgt2Mult = Param("Target 2 (x OR)", 2.0, 1.0, 4.0, 0.1);
+MinRR    = Param("Min R:R to Show", 1.0, 0.5, 3.0, 0.1);
+
+DiagMode = Param("Diagnostic Mode (1=on)", 0, 0, 1, 1);
+
+// ============================================================================
+// SECTION 2: OPENING RANGE
+// ============================================================================
+NewDay = Day() != Ref(Day(), -1) OR Month() != Ref(Month(), -1);
+
+BarsSinceNewDay = BarsSince(NewDay);          // 0 on the day's first bar
+
+OR_H = ValueWhen(BarsSinceNewDay == ORBars - 1, HighestSince(NewDay, High));
+OR_L = ValueWhen(BarsSinceNewDay == ORBars - 1, LowestSince(NewDay, Low));
+OR_O = ValueWhen(NewDay, Open, 1);
+
+OR_Range    = OR_H - OR_L;
+OR_RangePct = (OR_Range / Max(OR_O, 0.0001)) * 100;
+
+ORVolAvg = ValueWhen(BarsSinceNewDay == ORBars - 1, Sum(Volume, ORBars) / ORBars);
+
+tn         = TimeNum();
+ORComplete = BarsSinceNewDay >= ORBars;
+AfterOR    = ORComplete;
+BeforeCut  = tn < CutoffTime;
+
+// ============================================================================
+// SECTION 3: DAILY-TIMEFRAME FILTERS
+// ============================================================================
+// [FIX] inDaily, not "daily". TimeFrameSet and TimeFrameExpand take a numeric
+// interval; a string is a type error and the whole multi-timeframe block failed.
+TimeFrameSet(inDaily);
+    DailyEMALong  = EMA(Close, DailyEMALen);
+    DailyAboveEMA = Close > DailyEMALong;
+    DailyBelowEMA = Close < DailyEMALong;
+
+    DailyADXVal = ADX(14);
+    DailyADXOK  = DailyADXVal >= MinADX;
+
+    // Narrowest range of the last 7 sessions, today included: today's range
+    // against the lowest of the previous six.
+    DailyRange = High - Low;
+    NR7        = DailyRange <= Ref(LLV(DailyRange, 6), -1);
+    PrevNR7    = Ref(NR7, -1);          // yesterday's compression sets up today
+
+    DailyVolAvg = MA(Volume, 20);
+    PrevSIP     = Ref(Volume, -1) >= SIPVolMult * Ref(DailyVolAvg, -1);
+
+    DailyATRv = ATR(14);
+TimeFrameRestore();
+
+DailyEMALong  = TimeFrameExpand(DailyEMALong,  inDaily);
+DailyAboveEMA = TimeFrameExpand(DailyAboveEMA, inDaily);
+DailyBelowEMA = TimeFrameExpand(DailyBelowEMA, inDaily);
+DailyADXVal   = TimeFrameExpand(DailyADXVal,   inDaily);
+DailyADXOK    = TimeFrameExpand(DailyADXOK,    inDaily);
+YesterdayNR7  = TimeFrameExpand(PrevNR7,       inDaily);
+YesterdaySIP  = TimeFrameExpand(PrevSIP,       inDaily);
+DailyATR      = TimeFrameExpand(DailyATRv,     inDaily);
+
+// ============================================================================
+// SECTION 4: INTRADAY CONTEXT
+// ============================================================================
+AvgVol  = MA(Volume, VolMAPeriod);
+VolOK   = Volume >= VolMult * AvgVol;
+VolVsOR = Volume >= VolMult * Max(ORVolAvg, 0.0001);
+
+// [FIX] Session VWAP rebuilt on running totals. The old form was
+// Sum(C*V, BarsSince(NewDay)+1) — Sum needs a constant period, and a
+// bar-varying one is not something it can honour. Subtracting the running total
+// as it stood before the day's first bar gives the same intent with no variable
+// period. Typical price rather than close, which is what VWAP conventionally
+// weights.
+TP     = (High + Low + Close) / 3;
+cumPV  = Cum(TP * Volume);
+cumV   = Cum(Volume);
+basePV = ValueWhen(NewDay, cumPV - TP * Volume);
+baseV  = ValueWhen(NewDay, cumV - Volume);
+VWAPVal = (cumPV - basePV) / Max(cumV - baseV, 0.0001);
+
+LongVWAP  = Close > VWAPVal;
+ShortVWAP = Close < VWAPVal;
+
+TrendEMA  = EMA(Close, TrendEMAPeriod);
+TrendUp   = Close > TrendEMA;
+TrendDown = Close < TrendEMA;
+
+PrevClose = ValueWhen(NewDay, Ref(Close, -1), 1);
+GapPct    = (OR_O - PrevClose) / Max(PrevClose, 0.0001) * 100;
+GapOK     = abs(GapPct) <= MaxGapPct;
+
+RangeOK    = OR_RangePct >= MinORPct AND OR_RangePct <= MaxORPct;
+ORATRRatio = OR_Range / Max(DailyATR, 0.0001);
+ORATROK    = ORATRRatio >= MinORATR AND ORATRRatio <= MaxORATR;
+
+// DayOfWeek(): 0=Sunday, 1=Monday ... 6=Saturday.
+DOW = DayOfWeek();
+DOWOK = 1 + 0 * Close;
+if (UseDOW)
+    DOWOK = (DOW == 1 AND AllowMon) OR (DOW == 2 AND AllowTue)
+         OR (DOW == 3 AND AllowWed) OR (DOW == 4 AND AllowThu)
+         OR (DOW == 5 AND AllowFri);
+
+// --- Nifty direction ---------------------------------------------------
+// [FIX] A daily EMA of another symbol needs SetForeign so that TimeFrameSet has
+// that symbol's price arrays to compress. Calling Foreign() inside a
+// TimeFrameSet block, as v2.0 did, does not give a daily series of the index.
+//
+// Arrays, never scalars: the loop subscripts these, and `NiftyUp = 1` made
+// NiftyUp[i] a subscripted scalar the moment the filter was switched off.
+NiftyUp   = 1 + 0 * Close;
+NiftyDown = 1 + 0 * Close;
+if (UseNiftyFilter)
+{
+    SetForeign(NiftySymbol, True, True);
+        TimeFrameSet(inDaily);
+            nEMA = EMA(Close, NiftyEMALen);
+            nUpD = Close > nEMA;
+            nDnD = Close < nEMA;
+        TimeFrameRestore();
+        nUpX  = TimeFrameExpand(nUpD, inDaily);
+        nDnX  = TimeFrameExpand(nDnD, inDaily);
+        nEMAX = TimeFrameExpand(nEMA, inDaily);
+    RestorePriceArrays();
+
+    // A missing or misnamed index must not silently veto every signal on every
+    // symbol — that is indistinguishable from "the strategy found nothing".
+    NiftyMissing = IsNull(nEMAX);
+    NiftyUp   = NiftyMissing OR nUpX;
+    NiftyDown = NiftyMissing OR nDnX;
+}
+
+// ============================================================================
+// SECTION 5: BREAKOUT LEVELS
+// ============================================================================
+Buf       = BufPct / 100;
+LongTrig  = OR_H * (1 + Buf);
+ShortTrig = OR_L * (1 - Buf);
+
+// ============================================================================
+// SECTION 6: CONFLUENCE SCORE
+// ============================================================================
+// [FIX] Seven components, and a disabled filter contributes to NEITHER the score
+// nor the maximum. v2.0 awarded a point for every switched-off filter, so the
+// fewer filters you ran the higher you scored — backwards.
+//
+// Volume and OR/ATR are deliberately NOT scored: both are hard gates below, so
+// they could never contribute a zero and were padding the total by two.
+ScoreMax = 0;
+if (UseDailyEMA)     ScoreMax = ScoreMax + 1;
+if (UseDailyADX)     ScoreMax = ScoreMax + 1;
+if (UseNR7)          ScoreMax = ScoreMax + 1;
+if (UseSIP)          ScoreMax = ScoreMax + 1;
+if (UseVWAP)         ScoreMax = ScoreMax + 1;
+if (UseTrend)        ScoreMax = ScoreMax + 1;
+if (UseNiftyFilter)  ScoreMax = ScoreMax + 1;
+
+LongScore  = 0 * Close;
+ShortScore = 0 * Close;
+if (UseDailyEMA)
+{
+    LongScore  = LongScore  + IIf(DailyAboveEMA, 1, 0);
+    ShortScore = ShortScore + IIf(DailyBelowEMA, 1, 0);
+}
+if (UseDailyADX)
+{
+    LongScore  = LongScore  + IIf(DailyADXOK, 1, 0);
+    ShortScore = ShortScore + IIf(DailyADXOK, 1, 0);
+}
+if (UseNR7)
+{
+    LongScore  = LongScore  + IIf(YesterdayNR7, 1, 0);
+    ShortScore = ShortScore + IIf(YesterdayNR7, 1, 0);
+}
+if (UseSIP)
+{
+    LongScore  = LongScore  + IIf(YesterdaySIP, 1, 0);
+    ShortScore = ShortScore + IIf(YesterdaySIP, 1, 0);
+}
+if (UseVWAP)
+{
+    LongScore  = LongScore  + IIf(LongVWAP, 1, 0);
+    ShortScore = ShortScore + IIf(ShortVWAP, 1, 0);
+}
+if (UseTrend)
+{
+    LongScore  = LongScore  + IIf(TrendUp, 1, 0);
+    ShortScore = ShortScore + IIf(TrendDown, 1, 0);
+}
+if (UseNiftyFilter)
+{
+    LongScore  = LongScore  + IIf(NiftyUp, 1, 0);
+    ShortScore = ShortScore + IIf(NiftyDown, 1, 0);
+}
+
+// Every filter off means nothing left to disagree with, so the gate passes.
+LongPct  = 100 + 0 * Close;
+ShortPct = 100 + 0 * Close;
+if (ScoreMax > 0)
+{
+    LongPct  = LongScore  / ScoreMax * 100;
+    ShortPct = ShortScore / ScoreMax * 100;
+}
+
+// ============================================================================
+// SECTION 7: BODY QUALITY (vectorised — it was recomputed per bar in the loop)
+// ============================================================================
+CandleBody  = abs(Close - Open);
+CandleRange = Max(High - Low, 0.0001);
+BodyRatio   = CandleBody / CandleRange * 100;
+BodyORRatio = CandleBody / Max(OR_Range, 0.0001) * 100;
+BodyOK      = BodyRatio >= MinBodyPct AND BodyORRatio >= MinBodyORPct;
+
+LongBO  = IIf(EntryType == 0, Close > LongTrig,  High >= LongTrig);
+ShortBO = IIf(EntryType == 0, Close < ShortTrig, Low  <= ShortTrig);
+
+// Hoisted above the loop deliberately. AFL cannot subscript the result of a
+// function call, so ATR(ATRPeriod)[i] is a syntax error — the array has to be
+// bound to a name first and that name indexed. This is the same reason the
+// other scanners in this folder keep every indicator out of their bar loops.
+ATRVal = ATR(ATRPeriod);
+
+// ============================================================================
+// SECTION 8: STATE MACHINE — ENTRIES, RE-ENTRY, EXITS
+// ============================================================================
+// Closed candles only. During the session the last bar is still forming and its
+// high, low, close and volume can all still change, so a breakout read from it
+// can un-fire before the bar ends.
+lastBar = BarCount - 1;
+while (lastBar > 0 AND Volume[lastBar] == 0)
+    lastBar = lastBar - 1;
+lastClosed = lastBar - 1;
+while (lastClosed > 0 AND Volume[lastClosed] == 0)
+    lastClosed = lastClosed - 1;
+
+EvalBar = 0 * Close;
+if (lastClosed >= 0)
+    EvalBar[lastClosed] = 1;
+
+Buy   = 0 * Close;
+Short = 0 * Close;
+Sell  = 0 * Close;
+Cover = 0 * Close;
+
+SigEntry = 0 * Close;
+SigStop  = 0 * Close;
+SigTgt1  = 0 * Close;
+SigTgt2  = 0 * Close;
+IsReEntry = 0 * Close;
+ExitWhy  = 0 * Close;        // 1 = stop, 2 = target, 3 = time
+
+// [FIX] Loop state is SCALAR. In v2.0 these were bare scalars that the loop then
+// subscripted, which is a hard error — and where the intent was state, writing
+// to bar i and reading bar i back on the next pass meant the value never
+// carried, so the whole re-entry path could not fire even once.
+inTrade = 0;
+posEntry = 0; posStop = 0; posTgt = 0;
+reArmed = 0; reBars = 0; reDir = 0;
+orHighHeld = 0; orLowHeld = 0;
+tradesToday = 0;
+
+for (i = 1; i <= lastClosed; i++)
+{
+    if (NewDay[i])
+    {
+        inTrade = 0; posEntry = 0; posStop = 0; posTgt = 0;
+        reArmed = 0; reBars = 0; reDir = 0;
+        orHighHeld = 0; orLowHeld = 0;
+        tradesToday = 0;
+    }
+
+    forceOut = tn[i] >= ForceExitTime;
+
+    // ---- MANAGE AN OPEN POSITION ----------------------------------------
+    // [FIX] v2.0's Sell/Cover could only ever be true on the entry bar, so a
+    // position was never closed by its own stop or target. Exits are evaluated
+    // here, on every subsequent bar, which is also why ApplyStop is no longer
+    // needed to make the backtest mean anything.
+    if (inTrade == 1)
+    {
+        if (Low[i] <= posStop)      { Sell[i] = 1; ExitWhy[i] = 1; inTrade = 0; }
+        else if (High[i] >= posTgt) { Sell[i] = 1; ExitWhy[i] = 2; inTrade = 0; }
+        else if (forceOut)          { Sell[i] = 1; ExitWhy[i] = 3; inTrade = 0; }
+    }
+    else if (inTrade == -1)
+    {
+        if (High[i] >= posStop)     { Cover[i] = 1; ExitWhy[i] = 1; inTrade = 0; }
+        else if (Low[i] <= posTgt)  { Cover[i] = 1; ExitWhy[i] = 2; inTrade = 0; }
+        else if (forceOut)          { Cover[i] = 1; ExitWhy[i] = 3; inTrade = 0; }
+    }
+
+    // One entry per day, plus at most one pullback re-entry.
+    canEnter = inTrade == 0 AND tradesToday < 1 AND AfterOR[i] AND BeforeCut[i]
+               AND NOT forceOut AND RangeOK[i] AND ORATROK[i] AND DOWOK[i];
+
+    // ---- PULLBACK RE-ENTRY ----------------------------------------------
+    // Armed when a qualifying breakout happened that we could not take. Now we
+    // wait for price to come back to the broken level and hold it.
+    if (reArmed AND EnableReEntry)
+    {
+        reBars = reBars + 1;
+        if (reBars > ReEntryBars)
+            reArmed = 0;
+
+        if (reArmed AND reDir == 1)
+        {
+            tol = orHighHeld * ReEntryTol / 100;
+            if (Close[i] < orHighHeld - tol)
+                reArmed = 0;                       // level lost, not a retest
+            else
+            {
+                if (canEnter AND Low[i] <= orHighHeld + tol
+                    AND Close[i] > orHighHeld AND VolOK[i])
+                {
+                    Buy[i] = 1; IsReEntry[i] = 1;
+                    inTrade = 1; tradesToday = tradesToday + 1;
+                    posEntry = Close[i];
+                    posStop  = OR_L[i] * (1 - Buf);
+                    posTgt   = LongTrig[i] + Tgt2Mult * OR_Range[i];
+                    SigEntry[i] = posEntry; SigStop[i] = posStop;
+                    SigTgt1[i] = LongTrig[i] + Tgt1Mult * OR_Range[i];
+                    SigTgt2[i] = posTgt;
+                    reArmed = 0;
+                }
+            }
+        }
+        else
+        {
+            if (reArmed AND reDir == -1)
+            {
+                tol = orLowHeld * ReEntryTol / 100;
+                if (Close[i] > orLowHeld + tol)
+                    reArmed = 0;
+                else
+                {
+                    if (canEnter AND High[i] >= orLowHeld - tol
+                        AND Close[i] < orLowHeld AND VolOK[i])
+                    {
+                        Short[i] = 1; IsReEntry[i] = 1;
+                        inTrade = -1; tradesToday = tradesToday + 1;
+                        posEntry = Close[i];
+                        posStop  = OR_H[i] * (1 + Buf);
+                        posTgt   = ShortTrig[i] - Tgt2Mult * OR_Range[i];
+                        SigEntry[i] = posEntry; SigStop[i] = posStop;
+                        SigTgt1[i] = ShortTrig[i] - Tgt1Mult * OR_Range[i];
+                        SigTgt2[i] = posTgt;
+                        reArmed = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- FRESH BREAKOUT --------------------------------------------------
+    if (inTrade == 0 AND canEnter)
+    {
+        okLong  = (TradeDir == 0 OR TradeDir == 2) AND LongBO[i]
+                  AND LongPct[i] >= MinScorePct;
+        okShort = (TradeDir == 1 OR TradeDir == 2) AND ShortBO[i]
+                  AND ShortPct[i] >= MinScorePct;
+
+        gapPass = NOT UseGap OR GapOK[i];
+
+        if (okLong AND BodyOK[i] AND VolOK[i] AND gapPass)
+        {
+            Buy[i] = 1;
+            inTrade = 1; tradesToday = tradesToday + 1;
+            posEntry = Close[i];
+            posStop  = OR_L[i] * (1 - Buf);
+            if (OR_RangePct[i] > MaxRiskPct)
+                posStop = LongTrig[i] - 1.5 * ATRVal[i];
+            posTgt = LongTrig[i] + Tgt2Mult * OR_Range[i];
+            SigEntry[i] = posEntry; SigStop[i] = posStop;
+            SigTgt1[i] = LongTrig[i] + Tgt1Mult * OR_Range[i];
+            SigTgt2[i] = posTgt;
+        }
+        else
+        {
+            if (okShort AND BodyOK[i] AND VolOK[i] AND gapPass)
+            {
+                Short[i] = 1;
+                inTrade = -1; tradesToday = tradesToday + 1;
+                posEntry = Close[i];
+                posStop  = OR_H[i] * (1 + Buf);
+                if (OR_RangePct[i] > MaxRiskPct)
+                    posStop = ShortTrig[i] + 1.5 * ATRVal[i];
+                posTgt = ShortTrig[i] - Tgt2Mult * OR_Range[i];
+                SigEntry[i] = posEntry; SigStop[i] = posStop;
+                SigTgt1[i] = ShortTrig[i] - Tgt1Mult * OR_Range[i];
+                SigTgt2[i] = posTgt;
+            }
+            else
+            {
+                // Score was good enough but body / volume / gap were not. That
+                // is precisely the case the retest variant exists for.
+                if (EnableReEntry AND reArmed == 0)
+                {
+                    if (okLong)
+                    {
+                        reArmed = 1; reBars = 0; reDir = 1;
+                        orHighHeld = OR_H[i]; orLowHeld = OR_L[i];
+                    }
+                    if (okShort AND reArmed == 0)
+                    {
+                        reArmed = 1; reBars = 0; reDir = -1;
+                        orHighHeld = OR_H[i]; orLowHeld = OR_L[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SECTION 9: LEVELS AND R:R FOR DISPLAY
+// ============================================================================
+UseATRStop = OR_RangePct > MaxRiskPct;   // ATRVal is defined above the loop
+
+LongSL   = IIf(UseATRStop, LongTrig - 1.5 * ATRVal, OR_L * (1 - Buf));
+LongRisk = Max(LongTrig - LongSL, 0.0001);
+LongTgt1 = LongTrig + Tgt1Mult * OR_Range;
+LongTgt2 = LongTrig + Tgt2Mult * OR_Range;
+LongRR1  = (LongTgt1 - LongTrig) / LongRisk;
+LongRR2  = (LongTgt2 - LongTrig) / LongRisk;
+
+ShortSL   = IIf(UseATRStop, ShortTrig + 1.5 * ATRVal, OR_H * (1 + Buf));
+ShortRisk = Max(ShortSL - ShortTrig, 0.0001);
+ShortTgt1 = ShortTrig - Tgt1Mult * OR_Range;
+ShortTgt2 = ShortTrig - Tgt2Mult * OR_Range;
+ShortRR1  = (ShortTrig - ShortTgt1) / ShortRisk;
+ShortRR2  = (ShortTrig - ShortTgt2) / ShortRisk;
+
+// [FIX] ApplyStop's first argument is a numeric type constant, not a string, and
+// stopModePoint wants a DISTANCE rather than an absolute price. There is also no
+// per-direction form — one call covers both sides, so the risk distance is
+// selected per bar instead. Exits are already handled in the loop above; this
+// exists only so a formal backtest has protective stops of its own.
+if (EnableBT)
+{
+    RiskDist = IIf(Short, ShortRisk, LongRisk);
+    TgtDist  = IIf(Short, ShortTrig - ShortTgt2, LongTgt2 - LongTrig);
+    ApplyStop(stopTypeLoss,   stopModePoint, RiskDist, True);
+    ApplyStop(stopTypeProfit, stopModePoint, TgtDist,  True);
+}
+
+// ============================================================================
+// SECTION 10: EXPLORATION
+// ============================================================================
+SigRR = IIf(Short, ShortRR2, LongRR2);
+
+if (DiagMode == 1)
+    Filter = EvalBar;                 // one row per symbol, last closed bar
+else
+    Filter = (Buy OR Short) AND SigRR >= MinRR;
+
+AddTextColumn(WriteIf(Buy, "ORB_LONG", WriteIf(Short, "ORB_SHORT", "")), "Signal");
+AddTextColumn(WriteIf(IsReEntry, "retest", ""), "Type");
+AddColumn(DateTime(), "Bar", formatDateTime);
+AddColumn(Close, "Price", 1.2);
+AddColumn(SigEntry, "Entry", 1.2);
+AddColumn(SigStop, "SL", 1.2);
+AddColumn(SigTgt1, "Tgt1", 1.2);
+AddColumn(SigTgt2, "Tgt2", 1.2);
+AddColumn(SigRR, "R:R(2x)", 1.2);
+
+AddColumn(OR_H, "OR High", 1.2);
+AddColumn(OR_L, "OR Low", 1.2);
+AddColumn(OR_RangePct, "OR %", 1.2);
+AddColumn(ORATRRatio, "OR/ATR", 1.2);
+AddColumn(Volume / Max(AvgVol, 0.0001), "Vol xAvg", 1.1);
+
+AddColumn(IIf(Short, ShortScore, LongScore), "Score", 1.0);
+AddColumn(ScoreMax + 0 * Close, "of", 1.0);
+AddColumn(IIf(Short, ShortPct, LongPct), "Score %", 1.0);
+AddTextColumn(WriteIf((Buy OR Short) AND IIf(Short, ShortPct, LongPct) >= FullSizePct,
+              "FULL", WriteIf(Buy OR Short, "HALF", "")), "Size");
+
+AddColumn(GapPct, "Gap %", 1.2);
+AddColumn(VWAPVal, "VWAP", 1.2);
+AddColumn(DailyADXVal, "ADX", 1.0);
+AddTextColumn(WriteIf(YesterdayNR7, "Y", "n"), "NR7");
+AddTextColumn(WriteIf(YesterdaySIP, "Y", "n"), "SiP");
+
+if (DiagMode == 1)
+{
+    // [FIX] v2.0's diagnostic built its score with  if(arrayCondition) x++,
+    // which collapses an array to its last bar and then reports that one value
+    // for every row. These are the same arrays the entry logic uses, so the
+    // diagnostic and the strategy can no longer disagree.
+    AddTextColumn(
+        WriteIf(NOT TF_OK,        "0 wrong timeframe",
+        WriteIf(NOT AfterOR,      "1 OR not complete",
+        WriteIf(NOT RangeOK,      "2 OR range",
+        WriteIf(NOT ORATROK,      "3 OR/ATR",
+        WriteIf(NOT DOWOK,        "4 day of week",
+        WriteIf(NOT BeforeCut,    "5 past cutoff",
+        WriteIf(NOT (LongBO OR ShortBO), "6 no breakout",
+        WriteIf(IIf(Short OR ShortBO, ShortPct, LongPct) < MinScorePct,
+                                  "7 confluence",
+        WriteIf(NOT BodyOK,       "8 body quality",
+        WriteIf(NOT VolOK,        "9 volume",
+        WriteIf(UseGap AND NOT GapOK, "10 gap",
+        WriteIf(Buy, "** LONG **",
+        WriteIf(Short, "** SHORT **", "-- ready --"))))))))))))), "Blocked At");
+
+    AddColumn(LongPct, "L %", 1.0);
+    AddColumn(ShortPct, "S %", 1.0);
+    AddColumn(BodyRatio, "Body %", 1.0);
+    AddColumn(BarsSinceNewDay, "Bar #", 1.0);
+    AddColumn(DOW, "DOW", 1.0);
+    AddColumn(BarCount, "Bars Avail", 1.0);
+
+    // "Nothing today" and "this has never fired on this symbol" look identical
+    // on a per-bar view, and that is what makes a quiet scan impossible to
+    // debug. These separate them in one column.
+    AddColumn(Cum(IIf(Buy, 1, 0)), "Ever Long", 1.0);
+    AddColumn(Cum(IIf(Short, 1, 0)), "Ever Short", 1.0);
+}
+
+AddTextColumn(WriteIf(TF_OK, "15M", "WRONG TF — 15 min only"), "TF");
+
+// ============================================================================
+// SECTION 11: CHART
+// ============================================================================
+SetChartOptions(0, chartShowArrows | chartShowDates);
+Plot(Close, "Price", colorDefault, styleCandle);
+
+Plot(OR_H, "OR High", colorGreen, styleLine | styleThick);
+Plot(OR_L, "OR Low",  colorRed,   styleLine | styleThick);
+Plot(LongTrig,  "Long Trig",  colorBrightGreen, styleDashed | styleNoRescale);
+Plot(ShortTrig, "Short Trig", colorOrange,      styleDashed | styleNoRescale);
+Plot(VWAPVal,   "VWAP",       colorYellow,      styleLine | styleThick);
+Plot(TrendEMA, "EMA" + NumToStr(TrendEMAPeriod, 1.0), colorBlue, styleLine);
+
+PlotShapes(IIf(Buy,   shapeUpArrow,   shapeNone), colorBrightGreen, 0, Low,  -30);
+PlotShapes(IIf(Short, shapeDownArrow, shapeNone), colorRed,         0, High,  30);
+PlotShapes(IIf(Sell OR Cover, shapeSmallCircle, shapeNone), colorWhite, 0, Close, 0);
+
+// [FIX] VLine() is not an AFL function. A boolean plotted on its own scale as a
+// histogram is how AFL draws a vertical marker.
+Plot(tn >= CutoffTime AND tn < CutoffTime + 1500, "", colorLightGrey,
+     styleHistogram | styleOwnScale | styleNoLabel, 0, 1);
+
+// [FIX] PlotText took IIf() over string literals — IIf is numeric only — and an
+// ARRAY for its y coordinate, which must be a scalar. The score belongs in the
+// Title and the exploration column, both of which already carry it.
+
+Title = Name() + "  " + Date() + "  |  ORB SOTA 15M"
+      + "\nOR " + NumToStr(OR_L, 1.2) + " – " + NumToStr(OR_H, 1.2)
+      + "  (" + NumToStr(OR_RangePct, 1.2) + "%)"
+      + "   OR/ATR " + NumToStr(ORATRRatio, 1.2)
+      + "   gap " + NumToStr(GapPct, 1.2) + "%"
+      + "\nVWAP " + NumToStr(VWAPVal, 1.2)
+      + "   vol " + NumToStr(Volume / Max(AvgVol, 0.0001), 1.1) + "x"
+      + "   ADX " + NumToStr(DailyADXVal, 1.0)
+      + "\nlong > " + NumToStr(LongTrig, 1.2)
+      + "  score " + NumToStr(LongScore, 1.0) + "/" + NumToStr(ScoreMax, 1.0)
+      + " (" + NumToStr(LongPct, 1.0) + "%)"
+      + "   short < " + NumToStr(ShortTrig, 1.2)
+      + "  score " + NumToStr(ShortScore, 1.0) + "/" + NumToStr(ScoreMax, 1.0)
+      + " (" + NumToStr(ShortPct, 1.0) + "%)"
+      + "\nNR7 " + WriteIf(YesterdayNR7, "yes", "no")
+      + "   SiP " + WriteIf(YesterdaySIP, "yes", "no")
+      + "   DOW " + NumToStr(DOW, 1.0)
+      + WriteIf(TF_OK, "", "   [WRONG TIMEFRAME]");
+
+_SECTION_END();

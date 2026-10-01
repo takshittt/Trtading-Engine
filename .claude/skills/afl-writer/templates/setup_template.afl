@@ -1,0 +1,23 @@
+// ============================================================
+// setup_template.afl — copy to setup_N.afl, rename S1_ -> SN_.
+// Each setup defines ONLY: SN_Long, SN_Short, SN_LongSL, SN_ShortSL
+// Rule: use only data known at the entry bar's open
+//       (Ref(..., -1), levels from earlier bars, TimeNum()).
+// ============================================================
+
+_SECTION_BEGIN("Setup 1");
+S1_On     = ParamToggle("Setup 1", "Off|On", 1);
+S1_MaxGap = Param("Setup 1: skip if |gap| > %", 3, 0, 20, 0.1);
+_SECTION_END();
+
+S1_Entry = tn == EntryTime;                 // the 9:20 candle
+S1_GapOK = abs(GapPct) <= S1_MaxGap;
+
+// EXAMPLE rule — replace with the strategy document's exact wording:
+// long if the 9:15 candle closed green, short if it closed red
+S1_Long  = S1_On AND S1_Entry AND S1_GapOK AND Ref(Close, -1) > Ref(Open, -1);
+S1_Short = S1_On AND S1_Entry AND S1_GapOK AND Ref(Close, -1) < Ref(Open, -1);
+
+// Stop levels (prices). Null => main.afl uses DefaultSL.
+S1_LongSL  = FC_Low  - TickSize;
+S1_ShortSL = FC_High + TickSize;

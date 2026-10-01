@@ -1,0 +1,159 @@
+// swing_scan.afl — Reversal Strategy scan exporter (Amibroker Exploration)
+//
+// Writes one CSV row per BUY/SELL signal on closed candles; scan_bridge.py
+// forwards each row to the Reversal Strategy webhook. Uses only basic AFL (no ternary,
+// no function-result indexing) for maximum compatibility.
+//
+// Run this with Auto-repeat every 1 minute. The repeat interval is only how
+// often we LOOK; the signal bar is always a closed candle, so a 1H scan emits
+// at most one signal per symbol per hour no matter how often it runs.
+//
+// Replace the placeholder Buy/Sell rule below with your real Reversal logic.
+
+_SECTION_BEGIN("ReversalStrategyScan");
+
+// ---- timeframe (minutes) this scan is running at -------------------------
+// The backend only accepts 60, 240 and 1440 and now rejects anything else
+// loudly — a 30m scan used to be stored as "1H" and then deduped down to one
+// signal per hour.
+TF_MIN = Interval() / 60;   // 60=1H, 240=4H, 1440=1D
+
+// ---- ATR + nearest support / resistance ----------------------------------
+// These ARE the Target and the SL: the backend takes the resistance above as
+// the target and the support below as the stop. Both exclude the signal bar
+// itself (Ref -1) so a bar cannot be its own level.
+atrLen = Param("ATR Length", 14, 5, 50, 1);
+atrVal = ATR(atrLen);
+resLen = Param("S/R Lookback", 20, 5, 100, 1);
+resVal = HHV(Ref(High, -1), resLen);   // nearest resistance ABOVE -> Target
+supVal = LLV(Ref(Low, -1), resLen);    // nearest support BELOW    -> Stop Loss
+
+// ---- how far back to export ----------------------------------------------
+// 1 = only the newest closed candle, which is what a healthy minute-by-minute
+// scan needs. Raise it to re-export the previous N closed candles so a bar
+// missed while Amibroker or the bridge was down still reaches the backend.
+// Raising it also multiplies what each scan appends, so leave it at 1 unless
+// you are recovering from an outage.
+//
+// Do that deliberately: a backfilled bar the server never saw is a NEW signal,
+// not a duplicate, so with Paper Trading on it will be auto-executed at today's
+// price on a setup that fired hours ago. Dedup only protects bars already
+// stored.
+backfillBars = Param("Backfill Bars", 1, 1, 10, 1);
+
+// ---- PLACEHOLDER strategy: replace with your real rule -------------------
+fast = EMA(Close, 9);
+
+slow = EMA(Close, 21);
+
+Buy  = Cross(fast, slow);   // fast crosses ABOVE slow  -> BUY
+Sell = Cross(slow, fast);   // fast crosses BELOW slow  -> SELL
+
+// ExRem makes Buy/Sell strictly alternate (removes repeated same-side signals)
+// so SCAN shows clean, correct signals.
+Buy  = ExRem(Buy, Sell);
+Sell = ExRem(Sell, Buy);
+
+Short = Sell;   // short entry mirrors Sell
+Cover = Buy;    // cover mirrors Buy
+
+// ---- signal on CLOSED candles ONLY ---------------------------------------
+// During the session BarCount-1 is the candle still FORMING. Reading it means
+// the rule is evaluated on a partial bar: on a 1-hour chart scanned every
+// minute, a cross can appear at 11:28, fire, and then un-cross before 12:00 —
+// a repaint. That is what made an 11:00-stamped signal arrive at 11:28 and get
+// executed mid-candle.
+//
+// So step back one bar and act only on a candle that can no longer change.
+// Consequence, deliberately accepted: the session's final stub bar
+// (15:15-15:30) is never exported, because no later bar ever opens to close it.
+// Better to skip it than to trade a bar that can still move.
+lastBar = BarCount - 1;
+while (lastBar > 0 AND Volume[lastBar] == 0)
+    lastBar = lastBar - 1;    // skip zero-volume pad bars from "Pad & align"
+
+// Step back over pad bars here too. Landing on one meant reading a repeated
+// close where Buy/Sell are always 0, so an illiquid contract's signal was
+// silently dropped instead of exported.
+lastClosed = lastBar - 1;
+while (lastClosed > 0 AND Volume[lastClosed] == 0)
+    lastClosed = lastClosed - 1;
+
+firstClosed = lastClosed - (backfillBars - 1);
+if (firstClosed < 0)
+    firstClosed = 0;
+
+// ---- CSV export: ONE file per timeframe, append-only ----------------------
+// 1H -> scan_60.csv, 4H -> scan_240.csv, 1D -> scan_1440.csv.
+//
+// This file is a queue, not a snapshot. Every symbol only ever APPENDS, and the
+// bridge empties it once it has delivered what it read. Nothing here truncates.
+//
+// That is what makes it safe under multi-threading. Previously stocknum 0
+// opened the shared file with "w" and the rest appended — but Explorations run
+// across several threads, stocknum 0 is not guaranteed to go first, and any row
+// written before it arrived was erased. Removing the truncate removes the race:
+// concurrent appends can only ever add, never delete someone else's row.
+//
+// Each symbol builds its whole output first and writes it with a single fputs,
+// so a symbol's rows can't be interleaved with another's mid-line.
+tfStr = StrFormat("%.0f", TF_MIN);
+csvPath = "C:\\swing\\scan_" + tfStr + ".csv";
+
+// No header: an append-only queue has no single place to put one, and the
+// bridge reads the columns positionally in the order written below.
+out = "";
+
+yy = Year();   mo = Month();   dd = Day();
+hh = Hour();   mm = Minute();  ss = Second();
+
+if (lastClosed >= 0)
+{
+    for (i = firstClosed; i <= lastClosed; i++)
+    {
+        if (Volume[i] > 0)
+        {
+            act = "";
+            if (Sell[i])
+                act = "SELL";
+            if (Buy[i])
+                act = "BUY";      // BUY wins if a bar somehow carries both
+
+            if (StrLen(act) > 0)
+            {
+                barTime = StrFormat("%04.0f-%02.0f-%02.0fT%02.0f:%02.0f:%02.0f",
+                                    yy[i], mo[i], dd[i], hh[i], mm[i], ss[i]);
+
+                out = out + Name() + "," +
+                      tfStr + "," +
+                      act + "," +
+                      StrFormat("%.2f", Close[i]) + "," +
+                      StrFormat("%.2f", atrVal[i]) + "," +
+                      StrFormat("%.2f", resVal[i]) + "," +
+                      barTime + "," +
+                      StrFormat("%.2f", supVal[i]) + "\n";
+            }
+        }
+    }
+}
+
+// Only touch the file when this symbol actually has something to say — a scan
+// of 200 symbols with two signals opens the file twice, not 200 times.
+if (StrLen(out) > 0)
+{
+    fh = fopen(csvPath, "a");
+    if (fh)
+    {
+        fputs(out, fh);
+        fclose(fh);
+    }
+}
+
+// ---- Exploration columns (visual check inside Amibroker) -----------------
+Filter = Buy OR Sell;
+AddTextColumn(WriteIf(Buy, "BUY", WriteIf(Sell, "SELL", "")), "Signal");
+AddColumn(atrVal, "ATR");
+AddColumn(resVal, "Resistance");
+AddColumn(Close, "Price");
+
+_SECTION_END();

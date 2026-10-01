@@ -1,0 +1,88 @@
+/* =====================================================================
+   Grid F&O Scanner  →  Check-Signals grid   (DISPLAY ONLY)
+   ---------------------------------------------------------------------
+   Runs as an AmiBroker EXPLORATION over your F&O watchlist. Every run it
+   writes ONE CSV with, per symbol, a BUY / SELL / NEUTRAL for each of the
+   4 timeframes (5m, 15m, 1h, 4h) plus the timestamp the signal fired.
+
+   The Python bridge (scan_bridge.py) reads that CSV and POSTs it to the
+   Grid engine's /webhook/scan. Nothing here ever places an order.
+
+   SET UP (Analysis window):
+     1. Apply this formula.  Pick your F&O watchlist as the "filter".
+     2. Range: "n last bars" — a few hundred is plenty (needs enough bars
+        to form the 4h timeframe; base DB interval must be <= 5-minute).
+     3. Run "Explore".  Then tick Auto-Repeat (AR) = 5 minutes so it
+        re-scans every 5 min during market hours.
+     4. Edit CSV_PATH below to a folder the bridge can read.
+
+   >>> REPLACE the EMA-crossover block in scanLine() with YOUR strategy. <<<
+   Only the two lines that set `bs` (buy) and `ss` (sell) are the strategy;
+   everything else (sticky state, timestamp, CSV) stays as-is.
+   ===================================================================== */
+
+CSV_PATH = "C:\\grid\\scan_signals.csv";   // <-- edit to your path
+
+/* One symbol's line for a given timeframe. Returns "sym,tfmin,action,price,bar_time\n". */
+function scanLine( tfSeconds, tfMin )
+{
+    TimeFrameSet( tfSeconds );
+        // ---------- YOUR STRATEGY (example: 9/21 EMA crossover) ----------
+        fast = EMA( Close, 9 );
+        slow = EMA( Close, 21 );
+        bs   = Cross( fast, slow );     // BUY  when fast crosses ABOVE slow
+        ss   = Cross( slow, fast );     // SELL when fast crosses BELOW slow
+        // -----------------------------------------------------------------
+
+        ev   = bs OR ss;                        // any signal event
+        dir  = IIf( bs, 1, IIf( ss, -1, 0 ) );  // +1 buy / -1 sell
+
+        // sticky: state = direction of the MOST RECENT event; "" if none yet
+        lastDir = LastValue( ValueWhen( ev, dir ) );
+        px      = LastValue( ValueWhen( ev, Close ) );
+        yy      = LastValue( ValueWhen( ev, Year() ) );
+        mo      = LastValue( ValueWhen( ev, Month() ) );
+        dd      = LastValue( ValueWhen( ev, Day() ) );
+        hh      = LastValue( ValueWhen( ev, Hour() ) );
+        mi      = LastValue( ValueWhen( ev, Minute() ) );
+    TimeFrameRestore();
+
+    action = "NEUTRAL";
+    if ( lastDir == 1 )  action = "BUY";
+    if ( lastDir == -1 ) action = "SELL";
+
+    barTime = "";
+    price   = 0;
+    if ( action != "NEUTRAL" )
+    {
+        barTime = StrFormat( "%04.0f-%02.0f-%02.0fT%02.0f:%02.0f:00", yy, mo, dd, hh, mi );
+        price   = px;
+    }
+    return StrFormat( "%s,%.0f,%s,%g,%s\n", Name(), tfMin, action, price, barTime );
+}
+
+/* Build all four lines for this symbol. */
+out = scanLine( in5Minute,      5   )
+    + scanLine( in15Minute,     15  )
+    + scanLine( inHourly,       60  )
+    + scanLine( 4 * inHourly,   240 );
+
+/* Write the shared CSV: first symbol truncates + header, the rest append.
+   The bridge waits for the file to go quiet before sending, so a partial
+   read is self-correcting on the next 5-min run anyway. */
+isFirst = Status( "stocknum" ) == 0;
+mode = "a";                        // append for every symbol...
+if ( isFirst ) mode = "w";         // ...except the first, which truncates + writes the header
+fh = fopen( CSV_PATH, mode );
+if ( fh )
+{
+    if ( isFirst )
+        fputs( "symbol,timeframe_min,action,price,bar_time\n", fh );
+    fputs( out, fh );
+    fclose( fh );
+}
+
+/* On-screen exploration output (handy while testing) */
+Filter = 1;
+AddTextColumn( Name(), "Symbol" );
+AddColumn( LastValue( Close ), "Close", 1.2 );

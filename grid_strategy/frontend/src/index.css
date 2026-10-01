@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  @apply bg-gray-50 text-gray-800 antialiased;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ---------------------------------------------------------------------------
+   Dark theme (same mechanism as the Reversal dashboard).
+
+   Every component is written in light-mode utilities (bg-white, text-gray-800,
+   border-gray-200 …). Tailwind v4 compiles those to var(--color-*), so
+   remapping the palette under [data-theme="dark"] flips the entire app from
+   one place — no `dark:` variant has to be threaded through a single
+   component, and anything added later inherits the theme for free.
+
+   The gray ramp is inverted (50 becomes the darkest surface, 900 the
+   brightest text) so existing contrast relationships hold. Accent tints — the
+   -50/-100/-200 washes behind badges — become dark washes, while the
+   -600/-700 text shades brighten to stay legible on them.
+--------------------------------------------------------------------------- */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Neutral charcoal ramp matching the Gateway dashboard: a near-black page
+     (gray-950), gray-900 panels, gray-800 hairline borders. Cool-neutral, no
+     blue cast — the same restrained palette Gateway ships. */
+  --color-white: #111827;   /* panel surface — Gateway gray-900 */
+
+  --color-gray-50:  #030712; /* page shell — Gateway gray-950 */
+  --color-gray-100: #131b2a; /* raised chip / zebra / hover */
+  --color-gray-200: #1f2937; /* hairline border — Gateway gray-800 */
+  --color-gray-300: #374151; /* stronger border / divider */
+  --color-gray-400: #6b7280; /* faint text / icons */
+  --color-gray-500: #8b93a1; /* muted label text */
+  --color-gray-600: #aeb6c2;
+  --color-gray-700: #cbd2dc;
+  --color-gray-800: #e6eaf0; /* body text */
+  --color-gray-900: #f4f6fa; /* headings — brightest */
+
+  --color-emerald-50:  #0c2a20;
+  --color-emerald-100: #113a2c;
+  --color-emerald-200: #1d5942;
+  --color-emerald-300: #2b7a5b;
+  --color-emerald-500: #34d399;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+
+  --color-rose-50:  #33121b;
+  --color-rose-100: #451721;
+  --color-rose-200: #6b2130;
+  --color-rose-300: #8f2c3f;
+  --color-rose-400: #fb7185;
+  --color-rose-500: #fb7185;
+  --color-rose-600: #fb7185;
+  --color-rose-700: #fda4af;
+  --color-rose-800: #fecdd3;
+
+  --color-red-50:  #331114;
+  --color-red-100: #45161b;
+  --color-red-200: #6b2129;
+  --color-red-400: #f87171;
+  --color-red-500: #f87171;
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+
+  --color-amber-50:  #32240a;
+  --color-amber-100: #453310;
+  --color-amber-200: #6b4f1a;
+  --color-amber-300: #8f6b24;
+  --color-amber-400: #fbbf24;
+  --color-amber-500: #fbbf24;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+
+  /* Accent. Grid's accent lives on the `sky` scale; remap it to Gateway's
+     flat blue so every accent border/button/badge reads Gateway-blue, no cyan. */
+  --color-sky-50:  #0c1b34;
+  --color-sky-100: #12244a;
+  --color-sky-200: #1a3566;
+  --color-sky-300: #285294;
+  --color-sky-400: #60a5fa;
+  --color-sky-500: #3b82f6;
+  --color-sky-600: #60a5fa;
+  --color-sky-700: #93c5fd;
+
+  --color-violet-50:  #201a38;
+  --color-violet-100: #2a2350;
+  --color-violet-200: #3b3268;
+  --color-violet-300: #554a8f;
+  --color-violet-400: #a78bfa;
+  --color-violet-500: #a78bfa;
+  --color-violet-600: #a78bfa;
+  --color-violet-700: #c4b5fd;
+
+  --color-purple-500: #c084fc;
+  --color-purple-600: #c084fc;
+  --color-purple-700: #d8b4fe;
+}
+
+/* The gray ramp inverts, which would turn the gray-900/40|50 MODAL BACKDROPS
+   into a near-white wash — keep backdrops dark explicitly. */
+[data-theme="dark"] .bg-gray-900\/40 { background-color: rgb(0 0 0 / 0.62); }
+[data-theme="dark"] .bg-gray-900\/50 { background-color: rgb(0 0 0 / 0.68); }
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #3b4d6e; }
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #4d6289; }

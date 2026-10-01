@@ -1,0 +1,91 @@
+// ============================================================
+// risk_management.afl — two-phase profit booking
+//   1) partial exit at Target 1, then SL -> breakeven
+//   2) remaining position exits at SL or at the final exit time
+// Expects from main.afl: Buy, Short, BuyPrice, ShortPrice, LongSL, ShortSL, tn
+// Sets: Sell, Cover, SellPrice, CoverPrice, scale-outs in Buy/Short.
+// Exits are checked from the bar AFTER entry. SL is checked before T1 (conservative).
+// ============================================================
+
+_SECTION_BEGIN("Risk Management");
+T1Points  = Param("Target 1 (points)", 20, 0.05, 1000, 0.05);
+T1ExitPct = Param("Target 1 exit %", 50, 1, 100, 1);
+MoveToBE  = ParamToggle("SL to breakeven after T1", "No|Yes", 1);
+FinalExit = ParamTime("Final exit time", "15:15:00");
+_SECTION_END();
+
+Sell = 0; Cover = 0;
+SellPrice = Close; CoverPrice = Close;
+
+pos = 0; entry = 0; stop = 0; t1Done = False;
+
+for (i = 0; i < BarCount; i++)
+{
+    if (pos == 0)
+    {
+        if (Buy[i] AND tn[i] < FinalExit)
+        {
+            pos = 1; entry = BuyPrice[i]; stop = LongSL[i]; t1Done = False;
+            Short[i] = 0;
+        }
+        else if (Short[i] AND tn[i] < FinalExit)
+        {
+            pos = -1; entry = ShortPrice[i]; stop = ShortSL[i]; t1Done = False;
+            Buy[i] = 0;
+        }
+        else
+        {
+            Buy[i] = 0; Short[i] = 0;
+        }
+    }
+    else if (pos == 1)
+    {
+        Buy[i] = 0; Short[i] = 0;
+        if (Low[i] <= stop)
+        {
+            Sell[i] = 1; SellPrice[i] = Min(Open[i], stop); pos = 0;
+        }
+        else if (tn[i] >= FinalExit)
+        {
+            Sell[i] = 1; SellPrice[i] = Open[i]; pos = 0;
+        }
+        else if (!t1Done AND High[i] >= entry + T1Points)
+        {
+            t1Price = Max(Open[i], entry + T1Points);
+            if (T1ExitPct >= 100)
+            {
+                Sell[i] = 1; SellPrice[i] = t1Price; pos = 0;
+            }
+            else
+            {
+                Buy[i] = sigScaleOut; BuyPrice[i] = t1Price; t1Done = True;
+                if (MoveToBE) stop = entry;
+            }
+        }
+    }
+    else // pos == -1
+    {
+        Buy[i] = 0; Short[i] = 0;
+        if (High[i] >= stop)
+        {
+            Cover[i] = 1; CoverPrice[i] = Max(Open[i], stop); pos = 0;
+        }
+        else if (tn[i] >= FinalExit)
+        {
+            Cover[i] = 1; CoverPrice[i] = Open[i]; pos = 0;
+        }
+        else if (!t1Done AND Low[i] <= entry - T1Points)
+        {
+            t1Price = Min(Open[i], entry - T1Points);
+            if (T1ExitPct >= 100)
+            {
+                Cover[i] = 1; CoverPrice[i] = t1Price; pos = 0;
+            }
+            else
+            {
+                Short[i] = sigScaleOut; ShortPrice[i] = t1Price; t1Done = True;
+                if (MoveToBE) stop = entry;
+            }
+        }
+    }
+}

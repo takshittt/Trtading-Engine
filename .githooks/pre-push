@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Pre-push gate: every test suite must pass on the commit being pushed, or the
+# push is refused. Enabled per clone with `scripts/install-hooks.sh`.
+#
+# After the tests pass, the push deploys to the trading server when deploys are
+# switched on for this clone:
+#     git config hooks.deploy true
+# Off by default, because a deploy restarts live services (a Gateway restart
+# drops the broker session).
+#
+# Escape hatches, for when you know why:
+#     SKIP_TESTS=1  git push     push without running the suites
+#     SKIP_DEPLOY=1 git push     run the tests, but do not deploy this push
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+ZERO="0000000000000000000000000000000000000000"
+
+# git feeds one line per ref: <local ref> <local sha> <remote ref> <remote sha>.
+# Collect the distinct commits being pushed; a branch deletion has an all-zero
+# local sha and nothing to test.
+SHAS=()
+while read -r _lref lsha _rref _rsha; do
+  [ "$lsha" = "$ZERO" ] && continue
+  case " ${SHAS[*]-} " in *" $lsha "*) ;; *) SHAS+=("$lsha") ;; esac
+done
+
+if [ ${#SHAS[@]} -eq 0 ]; then
+  exit 0
+fi
+
+if [ "${SKIP_TESTS:-0}" = 1 ]; then
+  echo "pre-push: SKIP_TESTS=1 — pushing without running tests" >&2
+else
+  for sha in "${SHAS[@]}"; do
+    if ! "$ROOT/scripts/run-tests.sh" "$sha"; then
+      echo >&2
+      echo "pre-push: tests failed on $(git rev-parse --short "$sha") — push refused." >&2
+      echo "pre-push: fix and commit, or SKIP_TESTS=1 git push to override." >&2
+      exit 1
+    fi
+  done
+fi
+
+if [ "$(git config --bool hooks.deploy || echo false)" = true ] && [ "${SKIP_DEPLOY:-0}" != 1 ]; then
+  for sha in "${SHAS[@]}"; do
+    if ! "$ROOT/scripts/deploy.sh" "$sha"; then
+      echo "pre-push: deploy of $(git rev-parse --short "$sha") failed — push refused." >&2
+      echo "pre-push: SKIP_DEPLOY=1 git push to push without deploying." >&2
+      exit 1
+    fi
+  done
+fi

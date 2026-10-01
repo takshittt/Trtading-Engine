@@ -1,0 +1,17 @@
+# Python
+backend/venv/
+__pycache__/
+*.pyc
+backend/reversal_strategy.db*
+backend/swing_swager.db*
+backend/.env
+# Node
+frontend/node_modules/
+frontend/dist/
+# Logs
+*.log
+backend/data/margins.json
+# Contract map — a multi-MB dump re-downloaded daily, never source
+backend/data/scripmaster_*.txt
+# macOS
+.DS_Store

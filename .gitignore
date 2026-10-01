@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+venv/
+.venv/
+env/
+.env
+
+# Node / npm
+node_modules/
+dist/
+build/
+.cache/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+token_store*.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# SQLite databases (main file + WAL/SHM sidecar files, which must never
+# be checked out from git while the backend has the db open — doing so
+# corrupts it, since they have to stay byte-in-sync with an active connection)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+coverage/
+
+# Reversal Strategy — daily broker dumps / caches, never source
+reversal_strategy/backend/data/margins.json
+reversal_strategy/backend/data/scripmaster_*.txt

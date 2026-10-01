@@ -1,0 +1,227 @@
+// ORB_15Min_India.afl
+// Opening Range Breakout for NSE Cash / F&O | 15-Minute Timeframe
+// Run as EXPLORATION with Auto-repeat every 1-2 minutes.
+// No entries after 11:30 AM. One trade per day per symbol.
+
+_SECTION_BEGIN("ORB_15Min_India");
+
+// ============================================================================
+// SECTION 1: PARAMETERS
+// ============================================================================
+TF_MIN = Interval() / 60;
+TF_OK  = TF_MIN == 15;
+
+// 0 = Long Only, 1 = Short Only, 2 = Both
+TradeDir = Param("Trade Direction (0=Long 1=Short 2=Both)", 2, 0, 2, 1);
+
+// Breakout buffer (%). Price must exceed OR by this much.
+BufPct = Param("Breakout Buffer %", 0.15, 0.0, 1.0, 0.05);
+
+// Opening Range quality filters
+MinORPct = Param("Min OR Range %", 0.30, 0.1, 2.0, 0.1);   // Reject too-tight noise
+MaxORPct = Param("Max OR Range %", 3.00, 1.0, 8.0, 0.25);  // Reject post-gap explosion
+
+// Volume filter
+VolMult     = Param("Volume Multiplier vs Avg", 1.5, 1.0, 5.0, 0.1);
+VolMAPeriod = Param("Volume MA Period", 10, 5, 30, 1);
+
+// Trend context on 15-min chart
+TrendEMAPeriod = Param("Trend EMA Period", 20, 10, 50, 1);
+UseTrend       = Param("Use Trend Filter (1=yes)", 1, 0, 1, 1);
+
+// Gap filter: avoid stocks that gapped > 4% from prior close
+MaxGapPct = Param("Max Gap % from Prev Close", 4.0, 1.0, 10.0, 0.5);
+UseGap    = Param("Use Gap Filter (1=yes)", 1, 0, 1, 1);
+
+// Time cutoff (HHMMSS). Default 113000 = no entries on bars starting at 11:30 or later.
+// With start-time timestamps: last valid bar is 11:15-11:30.
+CutoffTime = Param("No Entry After (HHMMSS)", 113000, 93000, 153000, 1000);
+
+// Risk management
+ATRPeriod  = Param("ATR Period", 14, 5, 30, 1);
+MaxRiskPct = Param("Max OR Risk % of Open", 1.0, 0.3, 3.0, 0.1); 
+// If OR_Range > MaxRiskPct of Open, use ATR stop instead of opposite OR side
+
+// Targets (multiples of OR width)
+Tgt1Mult = Param("Target 1 (x OR)", 1.5, 1.0, 3.0, 0.1);
+Tgt2Mult = Param("Target 2 (x OR)", 2.0, 1.0, 4.0, 0.1);
+MinRR    = Param("Min R:R to Show", 1.0, 0.5, 3.0, 0.1);
+
+// ============================================================================
+// SECTION 2: OPENING RANGE & TIME WINDOW
+// ============================================================================
+NewDay = Day() != Ref(Day(), -1);
+
+// OR is the first bar of the day (09:15-09:30 on 15-min charts)
+OR_H = ValueWhen(NewDay, High, 1);
+OR_L = ValueWhen(NewDay, Low, 1);
+OR_O = ValueWhen(NewDay, Open, 1);
+
+OR_Range    = OR_H - OR_L;
+OR_RangePct = (OR_Range / OR_O) * 100;
+
+// Time checks (assuming bar timestamps are START of interval)
+tn        = TimeNum();
+AfterOR   = tn >= 93000;      // Start trading from 09:30 bar (09:30-09:45)
+BeforeCut = tn < CutoffTime;  // Exclude bars starting at/after cutoff
+
+// ============================================================================
+// SECTION 3: CONTEXT FILTERS
+// ============================================================================
+// Volume
+AvgVol = MA(Volume, VolMAPeriod);
+VolOK  = Volume >= VolMult * AvgVol;
+
+// Trend (15-min)
+TrendEMA = EMA(Close, TrendEMAPeriod);
+TrendUp  = Close > TrendEMA;
+TrendDown= Close < TrendEMA;
+
+// Gap from prior close
+PrevClose = ValueWhen(NewDay, Ref(Close, -1), 1);
+GapPct    = (OR_O - PrevClose) / PrevClose * 100;
+GapOK     = abs(GapPct) <= MaxGapPct;
+
+// Range quality
+RangeOK = OR_RangePct >= MinORPct AND OR_RangePct <= MaxORPct;
+
+// Combined filter (for diagnostics)
+ContextOK = RangeOK AND VolOK AND (NOT UseGap OR GapOK);
+
+// ============================================================================
+// SECTION 4: BREAKOUT LEVELS
+// ============================================================================
+Buf = BufPct / 100;
+LongTrig  = OR_H * (1 + Buf);
+ShortTrig = OR_L * (1 - Buf);
+
+// ============================================================================
+// SECTION 5: STATEFUL ENTRY LOGIC (One Trade Per Day)
+// ============================================================================
+Buy   = 0 * Close;
+Short = 0 * Close;
+inTrade = 0;   // 0 = flat, 1 = long, -1 = short
+
+for(i = 1; i < BarCount; i++)
+{
+    // Reset state at the start of each new day
+    if(NewDay[i]) 
+        inTrade = 0;
+    
+    // Only seek entries if flat, after OR, before cutoff, and range is valid
+    if(inTrade == 0 AND AfterOR[i] AND BeforeCut[i] AND RangeOK[i])
+    {
+        // LONG entry
+        if((TradeDir == 0 OR TradeDir == 2) AND High[i] >= LongTrig[i])
+        {
+            if(VolOK[i] AND (NOT UseTrend OR TrendUp[i]) AND (NOT UseGap OR GapOK[i]))
+            {
+                Buy[i] = 1;
+                inTrade = 1;
+            }
+        }
+        
+        // SHORT entry (only if long did not trigger same bar)
+        if(inTrade == 0 AND (TradeDir == 1 OR TradeDir == 2) AND Low[i] <= ShortTrig[i])
+        {
+            if(VolOK[i] AND (NOT UseTrend OR TrendDown[i]) AND (NOT UseGap OR GapOK[i]))
+            {
+                Short[i] = 1;
+                inTrade = -1;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SECTION 6: STOPS & TARGETS
+// ============================================================================
+ATRVal = ATR(ATRPeriod);
+
+// If OR is too wide, use ATR stop instead of full OR width
+UseATRStop = OR_RangePct > MaxRiskPct;
+
+// Long risk management
+LongSL = IIf(UseATRStop, LongTrig - 1.5 * ATRVal, OR_L * (1 - Buf));
+LongRisk = LongTrig - LongSL;
+
+// Short risk management
+ShortSL = IIf(UseATRStop, ShortTrig + 1.5 * ATRVal, OR_H * (1 + Buf));
+ShortRisk = ShortSL - ShortTrig;
+
+// Targets
+LongTgt1  = LongTrig + Tgt1Mult * OR_Range;
+LongTgt2  = LongTrig + Tgt2Mult * OR_Range;
+ShortTgt1 = ShortTrig - Tgt1Mult * OR_Range;
+ShortTgt2 = ShortTrig - Tgt2Mult * OR_Range;
+
+// R:R calculations
+LongRR1  = (LongTgt1 - LongTrig) / Max(LongRisk, 0.0001);
+ShortRR1 = (ShortTrig - ShortTgt1) / Max(ShortRisk, 0.0001);
+
+// ============================================================================
+// SECTION 7: EXPLORATION / SCAN OUTPUT
+// ============================================================================
+Filter = (Buy OR Short) AND (IIf(Buy, LongRR1, ShortRR1) >= MinRR);
+
+AddTextColumn(WriteIf(Buy, "ORB_LONG", WriteIf(Short, "ORB_SHORT", "")), "Signal", 1.0);
+AddColumn(Close, "Price", 1.2);
+AddColumn(OR_H, "OR High", 1.2);
+AddColumn(OR_L, "OR Low", 1.2);
+AddColumn(OR_RangePct, "OR Range %", 1.2);
+AddColumn(Volume / AvgVol, "Vol Ratio", 1.1);
+AddColumn(IIf(Buy, LongTrig, ShortTrig), "Entry Trigger", 1.2);
+AddColumn(IIf(Buy, LongSL, ShortSL), "Stop Loss", 1.2);
+AddColumn(IIf(Buy, LongTgt1, ShortTgt1), "Target 1", 1.2);
+AddColumn(IIf(Buy, LongTgt2, ShortTgt2), "Target 2", 1.2);
+AddColumn(IIf(Buy, LongRR1, ShortRR1), "R:R", 1.2);
+AddColumn(ATRVal, "ATR", 1.2);
+AddTextColumn(WriteIf(TF_OK, "OK", "WRONG TF - 15M ONLY"), "TF Check");
+
+// ============================================================================
+// SECTION 8: DIAGNOSTIC MODE (Optional)
+// ============================================================================
+// Set DiagMode=1 to see why symbols are NOT triggering.
+DiagMode = Param("Diagnostic Mode (1=on)", 0, 0, 1, 1);
+
+if(DiagMode == 1)
+{
+    Filter = TF_OK;  // Show every symbol on last bar
+    
+    AddTextColumn(
+        WriteIf(NOT RangeOK, "1 bad OR range",
+        WriteIf(NOT VolOK, "2 low volume",
+        WriteIf(UseGap AND NOT GapOK, "3 gap too big",
+        WriteIf(NOT AfterOR, "4 before OR",
+        WriteIf(NOT BeforeCut, "5 after cutoff",
+        WriteIf(UseTrend AND NOT TrendUp AND NOT TrendDown, "6 no trend",
+        WriteIf(Buy, "** LONG **", WriteIf(Short, "** SHORT **", "7 no break")))))))), "Blocked At");
+    
+    AddColumn(OR_RangePct, "OR Range %", 1.2);
+    AddColumn(Volume / AvgVol, "Vol Ratio", 1.1);
+    AddColumn(GapPct, "Gap %", 1.2);
+    AddColumn(TrendEMA, "EMA20", 1.2);
+    AddColumn(LongTrig, "Long Trig", 1.2);
+    AddColumn(ShortTrig, "Short Trig", 1.2);
+}
+
+// ============================================================================
+// SECTION 9: CHART PLOTTING
+// ============================================================================
+Plot(Close, "Price", colorDefault, styleCandle);
+Plot(OR_H, "OR High", colorGreen, styleLine | styleThick);
+Plot(OR_L, "OR Low", colorRed, styleLine | styleThick);
+Plot(TrendEMA, "EMA" + NumToStr(TrendEMAPeriod, 1.0), colorBlue, styleLine);
+
+PlotShapes(IIf(Buy, shapeUpArrow, shapeNone), colorBrightGreen, 0, Low, -25);
+PlotShapes(IIf(Short, shapeDownArrow, shapeNone), colorRed, 0, High, -25);
+
+Title = Name() + " | " + Date() + " | ORB 15Min" +
+        "\nOR: " + NumToStr(OR_L, 1.2) + " - " + NumToStr(OR_H, 1.2) + 
+        " (" + NumToStr(OR_RangePct, 1.2) + "%)" +
+        " | Gap: " + NumToStr(GapPct, 1.2) + "%" +
+        "\nTrend: " + WriteIf(TrendUp, "UP", WriteIf(TrendDown, "DOWN", "FLAT")) +
+        " | Vol: " + NumToStr(Volume / AvgVol, 1.1) + "x" +
+        "\nLong > " + NumToStr(LongTrig, 1.2) + "  |  Short < " + NumToStr(ShortTrig, 1.2);
+
+_SECTION_END();

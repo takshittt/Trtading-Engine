@@ -1,0 +1,402 @@
+//@version=6
+indicator("Setups 1-9 Visualiser (Algo.docx)", shorttitle="Setups 1-9", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ----------------------------- Inputs ----------------------------------------
+maType    = input.string("EMA", "MA type for 10/20", options=["EMA","DEMA","SMA"], group="General")
+tf_note   = input.bool(true, "Built for 5-min charts (use 1/3-min per doc as needed)", group="General")
+s1SLuse0925 = input.bool(true, "S1 SL reference = 0925 (2nd) candle  [off = first candle]", group="General")
+showArrows = input.bool(true, "Show signal arrows ON candles (move with chart)", group="General")
+showLabels = input.bool(true, "Show entry/SL price labels", group="General")
+tradeDir  = input.string("Both", "Trade direction", options=["Both","Buy only","Sell only"], group="General")
+dirBuy  = tradeDir != "Sell only"
+dirSell = tradeDir != "Buy only"
+gapThresh = input.float(3.0, "S6 gap threshold %", group="General")
+surgePct  = input.float(1.0, "Surge % for S5/S7", group="General")
+slMaxPct  = input.float(1.0, "Max SL % (invalidates S1/S6)", group="General")
+brkPrice  = input.float(0.0, "S8 breakout/breakdown price (0 = off)", group="Setup 8 (positional)")
+
+showS1 = input.bool(true,  "Setup 1  – breakout above day high", group="Show setups")
+showS2 = input.bool(true,  "Setup 2  – low-volume retracement",  group="Show setups")
+showS3 = input.bool(true,  "Setup 3  – 2 green candles off EMA",  group="Show setups")
+showS5 = input.bool(true,  "Setup 5  – missed surge",             group="Show setups")
+showS6 = input.bool(true,  "Setup 6  – gap reversal (>3%)",       group="Show setups")
+showS7 = input.bool(true,  "Setup 7  – 3-candle reversal",       group="Show setups")
+showS8 = input.bool(true,  "Setup 8  – price breakout",           group="Show setups")
+showS9 = input.bool(true,  "Setup 9  – non-green 1st candle",     group="Show setups")
+
+// ----------------------------- MA helper --------------------------------------
+ma(float s, int len) =>
+    e1   = ta.ema(s, len)
+    e2   = ta.ema(e1, len)
+    dema = 2 * e1 - e2
+    maType == "EMA" ? e1 : maType == "DEMA" ? dema : ta.sma(s, len)
+
+ma10 = ma(close, 10)
+ma20 = ma(close, 20)
+tick = syminfo.mintick
+
+plot(ma10, "MA10", color=color.new(color.aqua, 0))
+plot(ma20, "MA20", color=color.new(color.orange, 0))
+
+// ----------------------------- Previous day levels ----------------------------
+pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+plot(pdh, "PDH", color=color.new(color.gray, 40), style=plot.style_circles)
+
+// ----------------------------- Session framework ------------------------------
+bool newDay = na(time("D")[1]) or (time("D") != time("D")[1])
+
+var int barIdx = 0
+barIdx := newDay ? 0 : barIdx + 1
+
+isGreen = close > open
+isRed   = close < open
+
+// running day high/low (INCLUDING current bar)
+var float dayHigh = na
+var float dayLow  = na
+dayHigh := newDay ? high : math.max(dayHigh, high)
+dayLow  := newDay ? low  : math.min(dayLow,  low)
+
+// lowest-volume candle of the day so far
+var float minVol = na
+var float mvHigh = na
+var float mvLow  = na
+var bool  mvRed  = false
+var int   mvBar  = 0
+if newDay
+    minVol := volume
+    mvHigh := high
+    mvLow  := low
+    mvRed  := isRed
+    mvBar  := bar_index
+else if volume < minVol
+    minVol := volume
+    mvHigh := high
+    mvLow  := low
+    mvRed  := isRed
+    mvBar  := bar_index
+
+// red / green candle count of the day
+var int redCount = 0
+redCount := newDay ? (isRed ? 1 : 0) : redCount + (isRed ? 1 : 0)
+var int greenCount = 0
+greenCount := newDay ? (isGreen ? 1 : 0) : greenCount + (isGreen ? 1 : 0)
+
+// capture 1st candle (idx 0) and 2nd candle (idx 1)
+var float c1o=na
+var float c1h=na
+var float c1l=na
+var float c1c=na
+var float c1m10=na
+var float c1m20=na
+var float c2o=na
+var float c2h=na
+var float c2l=na
+var float c2c=na
+if barIdx == 0
+    c1o := open
+    c1h := high
+    c1l := low
+    c1c := close
+    c1m10 := ma10
+    c1m20 := ma20
+if barIdx == 1
+    c2o := open
+    c2h := high
+    c2l := low
+    c2c := close
+
+c1green = c1c > c1o
+c2green = c2c > c2o
+c1red   = c1c < c1o
+c2red   = c2c < c2o
+
+// exchange time gate for "up to 10 AM"
+hK = hour(time, "Asia/Kolkata")
+notExpired = hK < 10
+
+// ----------------------------- Signal helpers ---------------------------------
+makeBuy(bool cond, string tag, float buy, float sl) =>
+    if cond and showLabels
+        msg = tag + "  BUY\n" + str.tostring(buy, format.mintick) + "\nSL " + str.tostring(sl, format.mintick)
+        label.new(bar_index, low, msg, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+makeSell(bool cond, string tag, float sell, float sl) =>
+    if cond and showLabels
+        msg = tag + "  SELL\n" + str.tostring(sell, format.mintick) + "\nSL " + str.tostring(sl, format.mintick)
+        label.new(bar_index, high, msg, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// daily-reset trigger flags (buy + sell)
+var bool s1Trig=false
+var bool s2Trig=false
+var bool s6Trig=false
+var bool s9Trig=false
+var bool s1Dead=false
+var bool s1TrigS=false
+var bool s2TrigS=false
+var bool s9TrigS=false
+var bool s1DeadS=false
+if newDay
+    s1Trig := false
+    s2Trig := false
+    s6Trig := false
+    s9Trig := false
+    s1Dead := false
+    s1TrigS := false
+    s2TrigS := false
+    s9TrigS := false
+    s1DeadS := false
+
+// 2 consecutive closes below both EMAs -> S1 buy dead ; above -> S1 sell dead
+twoBelow = close < ma10 and close < ma20 and close[1] < ma10[1] and close[1] < ma20[1]
+twoAbove = close > ma10 and close > ma20 and close[1] > ma10[1] and close[1] > ma20[1]
+if twoBelow
+    s1Dead := true
+if twoAbove
+    s1DeadS := true
+
+// =============================================================================
+//  SETUP 1 : first candle green, closed > PDH & > 10/20 EMA -> buy above day high
+// =============================================================================
+// BUY: first candle green, > PDH & > 10/20 EMA -> buy above day high
+s1Select = barIdx >= 1 and c1green and c1c > pdh and c1c > c1m10 and c1c > c1m20
+buy1 = (na(dayHigh[1]) ? dayHigh : dayHigh[1]) + tick
+sl1  = (s1SLuse0925 ? c2l : c1l) - tick
+slPct1 = (buy1 - sl1) / buy1 * 100.0
+s1OK   = showS1 and dirBuy and s1Select and not s1Dead and notExpired and not s1Trig and slPct1 <= slMaxPct and not na(sl1)
+s1Fire = s1OK and high >= buy1
+makeBuy(s1Fire, "S1", buy1, sl1)
+if s1Fire
+    s1Trig := true
+
+// SELL (explicit in doc): first candle red, < PDL & < 10/20 EMA -> sell below day low
+s1SelectS = barIdx >= 1 and c1red and c1c < pdl and c1c < c1m10 and c1c < c1m20
+sell1 = (na(dayLow[1]) ? dayLow : dayLow[1]) - tick
+sl1s  = (s1SLuse0925 ? c2h : c1h) + tick
+slPct1s = (sl1s - sell1) / sell1 * 100.0
+s1OKs   = showS1 and dirSell and s1SelectS and not s1DeadS and notExpired and not s1TrigS and slPct1s <= slMaxPct and not na(sl1s)
+s1FireS = s1OKs and low <= sell1
+makeSell(s1FireS, "S1", sell1, sl1s)
+if s1FireS
+    s1TrigS := true
+
+// =============================================================================
+//  SETUP 2 : buy above lowest-volume RED candle of the day (retracement)
+//            only for S1-selected stocks, only until S1 has fired
+// =============================================================================
+// BUY: lowest-volume RED candle, for S1-selected stocks, until S1 fires
+s2Armed = showS2 and dirBuy and s1Select and not s1Trig and not s2Trig and redCount >= 2 and mvRed
+buy2 = mvHigh + tick
+sl2  = mvLow - tick
+s2Fire = s2Armed and high >= buy2
+makeBuy(s2Fire, "S2", buy2, sl2)
+if s2Fire
+    s2Trig := true
+
+// SELL (mirror): lowest-volume GREEN candle, for S1-sell-selected stocks
+s2ArmedS = showS2 and dirSell and s1SelectS and not s1TrigS and not s2TrigS and greenCount >= 2 and not mvRed
+sell2 = mvLow - tick
+sl2s  = mvHigh + tick
+s2FireS = s2ArmedS and low <= sell2
+makeSell(s2FireS, "S2", sell2, sl2s)
+if s2FireS
+    s2TrigS := true
+
+// =============================================================================
+//  SETUP 3 : green candle touches 10/20 EMA & closes above both, then a 2nd
+//            green candle closes above its high -> buy above 2nd green candle
+// =============================================================================
+// BUY: green candle touches 10/20 EMA & closes above both, then 2nd green > its high
+greenTouch = isGreen and (low <= ma10 or low <= ma20) and close > ma10 and close > ma20
+var float s3baseHigh = na
+var bool  s3baseSet  = false
+if newDay
+    s3baseSet := false
+    s3baseHigh := na
+// a DEMA-touch candle is always a NEW base (A), never a confirmation (B)
+s3Confirm = showS3 and dirBuy and s3baseSet and isGreen and close > s3baseHigh and not greenTouch
+buy3 = high + tick
+sl3  = low - tick
+makeBuy(s3Confirm, "S3", buy3, sl3)
+// (re)arm base AFTER checking confirm so a single bar can't be base+confirm
+if greenTouch
+    s3baseHigh := high
+    s3baseSet  := true
+if s3Confirm
+    s3baseSet := false
+
+// SELL (mirror): red candle touches 10/20 EMA & closes below both, then 2nd red < its low
+redTouch = isRed and (high >= ma10 or high >= ma20) and close < ma10 and close < ma20
+var float s3baseLow = na
+var bool  s3baseSetS = false
+if newDay
+    s3baseSetS := false
+    s3baseLow := na
+s3ConfirmS = showS3 and dirSell and s3baseSetS and isRed and close < s3baseLow and not redTouch
+sell3 = low - tick
+sl3s  = high + tick
+makeSell(s3ConfirmS, "S3", sell3, sl3s)
+if redTouch
+    s3baseLow := low
+    s3baseSetS := true
+if s3ConfirmS
+    s3baseSetS := false
+
+// =============================================================================
+//  SETUP 5 : missed surge (>1% over <=3 bars) -> buy above first opposite
+//            (red) candle, or previous candle, whichever is higher
+// =============================================================================
+move3 = na(close[3]) ? 0.0 : (close - close[3]) / close[3] * 100.0
+move1 = (close - open) / open * 100.0
+surgedUp   = move3 >= surgePct or move1 >= surgePct
+surgedDown = move3 <= -surgePct or move1 <= -surgePct
+// BUY: after up-surge, first red candle -> buy above it / prev (whichever higher)
+s5Fire = showS5 and dirBuy and surgedUp and isRed
+buy5 = math.max(high, high[1]) + tick
+sl5  = low - tick
+makeBuy(s5Fire, "S5", buy5, sl5)
+// SELL (mirror): after down-surge, first green candle -> sell below it / prev (whichever lower)
+s5FireS = showS5 and dirSell and surgedDown and isGreen
+sell5 = math.min(low, low[1]) - tick
+sl5s  = high + tick
+makeSell(s5FireS, "S5", sell5, sl5s)
+
+// =============================================================================
+//  SETUP 6 : gap reversal (>3%). Gap-down + first 2 green -> buy above 0925 candle.
+//            Gap-up + first 2 red -> sell below 0925 candle (mirror shown).
+// =============================================================================
+gapPct = na(pdc) ? 0.0 : (c1o - pdc) / pdc * 100.0
+gapDown = gapPct <= -gapThresh
+gapUp   = gapPct >=  gapThresh
+// BUY case
+buy6 = c2h + tick
+sl6b = c2l - tick
+slPct6b = (buy6 - sl6b) / buy6 * 100.0
+s6BuyOK = showS6 and dirBuy and barIdx >= 2 and gapDown and c1green and c2green and not s6Trig and slPct6b <= slMaxPct
+s6BuyFire = s6BuyOK and high >= buy6
+makeBuy(s6BuyFire, "S6", buy6, sl6b)
+// SELL case (mirror)
+sell6 = c2l - tick
+sl6s  = c2h + tick
+slPct6s = (sl6s - sell6) / sell6 * 100.0
+s6SellOK = showS6 and dirSell and barIdx >= 2 and gapUp and c1red and c2red and not s6Trig and slPct6s <= slMaxPct
+s6SellFire = s6SellOK and low <= sell6
+makeSell(s6SellFire, "S6", sell6, sl6s)
+if s6BuyFire or s6SellFire
+    s6Trig := true
+
+// =============================================================================
+//  SETUP 7 : 3-candle reversal. Window = last 3 candles (incl current). Needs a
+//            >1% move in the window, and the day's lowest-volume candle must be
+//            one of the two same-colour candles inside the window.
+//   BUY  (bullish): 2 prior candles RED + current GREEN reversal, day's lowest-
+//                   volume candle is one of those reds (red & within window).
+//   SELL (bearish): 2 prior candles GREEN + current RED reversal, day's lowest-
+//                   volume candle is one of those greens.
+//   Buy above the 3-candle high / SL below lowest-vol red candle ; sell mirror.
+// =============================================================================
+// Per doc demo: the CURRENT candle is the day's lowest-volume candle and is the
+// same colour as the move; with the previous candle that makes "two same-colour
+// candles". Trade the reversal by breaking the PREVIOUS candle; SL beyond the
+// current (lowest-volume) candle.
+//   BEARISH (sell): current = lowest-vol GREEN, prev GREEN -> sell below prev low,
+//                   SL above current high.
+//   BULLISH (buy):  current = lowest-vol RED,   prev RED   -> buy above prev high,
+//                   SL below current low.
+range3      = (ta.highest(high, 3) - ta.lowest(low, 3)) / close * 100.0
+bigMove     = range3 >= surgePct
+curIsLowVol = mvBar == bar_index
+s7Buy  = showS7 and dirBuy  and bigMove and curIsLowVol and mvRed       and isRed[1]
+s7Sell = showS7 and dirSell and bigMove and curIsLowVol and not mvRed   and isGreen[1]
+buy7  = high[1] + tick
+sl7b  = low - tick
+sell7 = low[1] - tick
+sl7s  = high + tick
+makeBuy(s7Buy,  "S7", buy7,  sl7b)
+makeSell(s7Sell, "S7", sell7, sl7s)
+
+// =============================================================================
+//  SETUP 8 : positional price breakout. Persists across days (no daily reset).
+//            Close above brkPrice on a GREEN candle -> then S5-style: buy above
+//            the first following RED candle.
+// =============================================================================
+// BUY: close ABOVE brkPrice on a green candle -> arm, then S5-style buy on next red
+var bool s8Armed = false
+if brkPrice > 0.0
+    if not s8Armed and close > brkPrice and isGreen
+        s8Armed := true
+s8Fire = showS8 and dirBuy and brkPrice > 0.0 and s8Armed and isRed
+buy8 = math.max(high, high[1]) + tick
+sl8  = low - tick
+makeBuy(s8Fire, "S8", buy8, sl8)
+if s8Fire
+    s8Armed := false
+
+// SELL (mirror): close BELOW brkPrice on a red candle -> arm, then S5-style sell on next green
+var bool s8ArmedS = false
+if brkPrice > 0.0
+    if not s8ArmedS and close < brkPrice and isRed
+        s8ArmedS := true
+s8FireS = showS8 and dirSell and brkPrice > 0.0 and s8ArmedS and isGreen
+sell8 = math.min(low, low[1]) - tick
+sl8s  = high + tick
+makeSell(s8FireS, "S8", sell8, sl8s)
+if s8FireS
+    s8ArmedS := false
+
+// =============================================================================
+//  SETUP 9 : first candle NOT green (doji/red) but closed > PDH & 10/20 EMA.
+//            Once a later candle closes above the first candle's high, treat as
+//            S1: buy above day high, SL below first candle.
+// =============================================================================
+// BUY: 1st candle NOT green but closed > PDH & 10/20 EMA; later candle closes above its high
+s9Select = barIdx >= 1 and (not c1green) and c1c > pdh and c1c > c1m10 and c1c > c1m20
+s9Confirmed = s9Select and close > c1h
+buy9 = (na(dayHigh[1]) ? dayHigh : dayHigh[1]) + tick
+sl9  = c1l - tick
+slPct9 = (buy9 - sl9) / buy9 * 100.0
+s9OK   = showS9 and dirBuy and s9Confirmed and not s9Trig and notExpired and slPct9 <= slMaxPct
+s9Fire = s9OK and high >= buy9
+makeBuy(s9Fire, "S9", buy9, sl9)
+if s9Fire
+    s9Trig := true
+
+// SELL (mirror): 1st candle NOT red but closed < PDL & 10/20 EMA; later candle closes below its low
+s9SelectS = barIdx >= 1 and (not c1red) and c1c < pdl and c1c < c1m10 and c1c < c1m20
+s9ConfirmedS = s9SelectS and close < c1l
+sell9 = (na(dayLow[1]) ? dayLow : dayLow[1]) - tick
+sl9s  = c1h + tick
+slPct9s = (sl9s - sell9) / sell9 * 100.0
+s9OKs   = showS9 and dirSell and s9ConfirmedS and not s9TrigS and notExpired and slPct9s <= slMaxPct
+s9FireS = s9OKs and low <= sell9
+makeSell(s9FireS, "S9", sell9, sl9s)
+if s9FireS
+    s9TrigS := true
+
+// ----------------------------- Signal arrows (anchored to candles) ------------
+// plotshape arrows are natively attached to each bar, so they pan/zoom and move
+// exactly with the candles (unlike free-floating labels).
+plotshape(showArrows and s1Fire,      "S1 buy",  shape.triangleup,   location.belowbar, color.new(color.green, 0), text="S1", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s2Fire,      "S2 buy",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),  text="S2", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s3Confirm,   "S3 buy",  shape.triangleup,   location.belowbar, color.new(color.teal, 0),  text="S3", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s5Fire,      "S5 buy",  shape.triangleup,   location.belowbar, color.new(color.olive, 0),  text="S5", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s6BuyFire,   "S6 buy",  shape.triangleup,   location.belowbar, color.new(color.green, 0),  text="S6", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s7Buy,       "S7 buy",  shape.triangleup,   location.belowbar, color.new(color.aqua, 0),   text="S7", textcolor=color.black, size=size.tiny)
+plotshape(showArrows and s8Fire,      "S8 buy",  shape.triangleup,   location.belowbar, color.new(color.purple, 0), text="S8", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s9Fire,      "S9 buy",  shape.triangleup,   location.belowbar, color.new(color.blue, 0),   text="S9", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s1FireS,     "S1 sell", shape.triangledown, location.abovebar, color.new(color.red, 0),    text="S1", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s2FireS,     "S2 sell", shape.triangledown, location.abovebar, color.new(color.red, 20),   text="S2", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s3ConfirmS,  "S3 sell", shape.triangledown, location.abovebar, color.new(color.fuchsia,0), text="S3", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s5FireS,     "S5 sell", shape.triangledown, location.abovebar, color.new(color.orange, 0), text="S5", textcolor=color.black, size=size.tiny)
+plotshape(showArrows and s6SellFire,  "S6 sell", shape.triangledown, location.abovebar, color.new(color.red, 0),    text="S6", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s7Sell,      "S7 sell", shape.triangledown, location.abovebar, color.new(color.maroon, 0), text="S7", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s8FireS,     "S8 sell", shape.triangledown, location.abovebar, color.new(color.purple,20), text="S8", textcolor=color.white, size=size.tiny)
+plotshape(showArrows and s9FireS,     "S9 sell", shape.triangledown, location.abovebar, color.new(color.navy, 0),   text="S9", textcolor=color.white, size=size.tiny)
+
+// ----------------------------- Selection background ---------------------------
+bgcolor(s1Select  and not s1Trig  and notExpired ? color.new(color.green, 92) : na, title="S1 buy watch")
+bgcolor(s9Select  and not s9Trig  and notExpired ? color.new(color.blue,  92) : na, title="S9 buy watch")
+bgcolor(s1SelectS and not s1TrigS and notExpired ? color.new(color.red,   92) : na, title="S1 sell watch")
+bgcolor(s9SelectS and not s9TrigS and notExpired ? color.new(color.maroon,92) : na, title="S9 sell watch")

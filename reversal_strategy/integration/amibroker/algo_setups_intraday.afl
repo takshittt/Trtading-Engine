@@ -1,0 +1,749 @@
+// algo_setups_intraday.afl — Algo.docx intraday setups 1, 2, 3, 6, 7, 9
+//
+// Amibroker port of the "Setups 1-9 Visualiser" Pine script, corrected against
+// the source document Algo.docx rather than against the Pine. Where the two
+// disagreed the doc won; every such case is marked  [DOC FIX]  below so the
+// difference from the TradingView chart is findable rather than mysterious.
+//
+// SCANNER ONLY — this writes no CSV and does not feed the Reversal Strategy backend.
+// That is deliberate: the backend's _TF_MAP accepts 60 / 240 / 1440 and rejects
+// everything else, and these setups carry their own stops (one tick beyond a
+// specific candle) which the backend's exit engine would override. Wiring it in
+// needs both of those settled first.
+//
+// Setups 4, 5 and 8 are NOT here. 4 does not exist in the Pine at all and would
+// have to be written from the doc; 5 needs the "trade was missed" gate the Pine
+// omits; 8 needs a per-symbol breakout price, which a single Param cannot carry
+// across a watchlist.
+//
+// ---------------------------------------------------------------------------
+// HOW TO RUN
+//   Chart interval : 5-minute (the doc's default; 1 and 3 also work)
+//   Analysis range : "All quotations" for research, or "n last quotations" with
+//                    n >= 30 for a live scan. Signals are written on CLOSED bars
+//                    only, so a 1-bar range shows nothing — the last bar is the
+//                    one still forming.
+//   Auto-repeat    : every 1 minute. Repeating only changes how often we LOOK;
+//                    a closed 5-min candle cannot change, so a setup fires at
+//                    most once per bar however often the scan runs.
+//
+// The Status column is the important one. ARMED means the setup is valid and an
+// order should be resting at Entry; FIRED means a closed bar actually traded
+// through that level. The Pine conflated these — S1/S2/S6/S9 only drew on the
+// trigger being hit, while S3/S7 drew when the pattern completed — so the same
+// arrow meant two different things depending on the setup.
+// ---------------------------------------------------------------------------
+
+_SECTION_BEGIN("AlgoSetupsIntraday");
+
+// ---- SECTION 1: PARAMETERS -----------------------------------------------
+
+// [DOC FIX] DEMA, not EMA. The Pine defaulted this dropdown to "EMA" while
+// Algo.docx says "10dema"/"20dema" in every one of its references. That is not
+// cosmetic: the moving average decides WHICH STOCKS ARE SELECTED in setups 1
+// and 9 and where the touch is in setup 3, so an EMA default quietly scans a
+// different universe than the document describes.
+MAType = Param("MA Type (0=DEMA 1=EMA 2=SMA)", 0, 0, 2, 1);
+MALen1 = Param("Fast MA Length", 10, 5, 50, 1);
+MALen2 = Param("Slow MA Length", 20, 10, 100, 1);
+
+// 0 = both, 1 = buy only, 2 = sell only.
+TradeDir = Param("Trade Direction (0=both 1=buy 2=sell)", 0, 0, 2, 1);
+
+// Doc: "If SL coming more than 1% of stock value algo will dis-regard trade
+// through this set up". Applies to setups 1, 6 and 9.
+SLMaxPct = Param("Max SL % (invalidates S1/S6/S9)", 1.0, 0.2, 5.0, 0.1);
+
+// Doc setup 6: "gapped up or gapped down more than 3%".
+GapThresh = Param("S6 Gap Threshold %", 3.0, 1.0, 10.0, 0.25);
+
+// Doc setup 7: "Stock should give a good surge (>1%, bigger the better)".
+SurgePct = Param("S7 Surge %", 1.0, 0.3, 5.0, 0.1);
+
+// Doc: "Set up will take trade up to 10 AM (9 candles/5min)". Expressed in
+// MINUTES FROM THE OPEN rather than as a clock time on purpose — Amibroker can
+// stamp a compressed bar with either its start or its end depending on a
+// Preferences setting, so a TimeNum() comparison against 100000 silently shifts
+// by one candle depending on a checkbox nobody remembers setting. Counting bars
+// from the day's first bar is immune to that. 45 minutes from 09:15 = 10:00,
+// which is 9 bars on 5-min, 15 on 3-min, 45 on 1-min.
+EntryCutoffMin = Param("Entry Cutoff (minutes from open)", 45, 5, 375, 5);
+
+// Doc setup 1: "once order executes SL will be placed below 0925 candle". On a
+// 5-min chart with the session opening 09:15 the candle that closes at 09:25 is
+// the SECOND of the day, so this defaults to the 2nd candle.
+S1SLUse0925 = Param("S1 stop from 0925 candle (0=1st candle)", 1, 0, 1, 1);
+
+// Doc setup 3: "This set up can be played twice in same stock ... if second
+// time also SL hit then abort the trade".
+S3MaxPlays = Param("S3 Max Plays Per Day", 2, 1, 5, 1);
+
+ShowS1 = Param("Show Setup 1", 1, 0, 1, 1);
+ShowS2 = Param("Show Setup 2", 1, 0, 1, 1);
+ShowS3 = Param("Show Setup 3", 1, 0, 1, 1);
+ShowS6 = Param("Show Setup 6", 1, 0, 1, 1);
+ShowS7 = Param("Show Setup 7", 1, 0, 1, 1);
+ShowS9 = Param("Show Setup 9", 1, 0, 1, 1);
+
+// Armed rows are the ones you act on — an armed setup is an order that should
+// be resting in the market. Turn them off to see only what actually triggered.
+ShowArmed = Param("List ARMED setups too", 1, 0, 1, 1);
+DiagMode  = Param("Diagnostic Mode", 0, 0, 1, 1);
+
+DirBuy  = TradeDir != 2;
+DirSell = TradeDir != 1;
+
+// ---- timeframe guard ------------------------------------------------------
+// A warning, not a refusal: nothing is exported, so running this on the wrong
+// interval wastes a scan rather than corrupting anything downstream. The doc
+// allows 1, 3 and 5.
+TF_MIN = Interval() / 60;
+TF_OK  = TF_MIN == 5 OR TF_MIN == 3 OR TF_MIN == 1;
+
+// One tick. NSE cash and F&O are 0.05; TickSize comes from the symbol's own
+// information and is 0 when that has never been filled in, which would put
+// every entry exactly ON the level instead of one tick beyond it.
+tick = TickSize;
+if (tick <= 0)
+    tick = 0.05;
+
+MaxEntryBars = EntryCutoffMin / TF_MIN;
+
+// ---- SECTION 2: VECTORISED INDICATORS ------------------------------------
+if (MAType == 0)
+{
+    MA1 = DEMA(Close, MALen1);
+    MA2 = DEMA(Close, MALen2);
+}
+if (MAType == 1)
+{
+    MA1 = EMA(Close, MALen1);
+    MA2 = EMA(Close, MALen2);
+}
+if (MAType == 2)
+{
+    MA1 = MA(Close, MALen1);
+    MA2 = MA(Close, MALen2);
+}
+
+IsGreen = Close > Open;
+IsRed   = Close < Open;
+
+// Previous day's high / low / close, held constant across every bar of today.
+// shift -1 reaches the PREVIOUS completed daily bar, so this cannot see into
+// the current day and cannot repaint.
+PDH = TimeFrameGetPrice("H", inDaily, -1);
+PDL = TimeFrameGetPrice("L", inDaily, -1);
+PDC = TimeFrameGetPrice("C", inDaily, -1);
+
+// Doc setup 1 invalidation: "If any given time 2 candles (5 min) closes below
+// 10dema & 20dema both, then set up becomes invalid".
+TwoBelow = Close < MA1 AND Close < MA2 AND Ref(Close, -1) < Ref(MA1, -1)
+                                       AND Ref(Close, -1) < Ref(MA2, -1);
+TwoAbove = Close > MA1 AND Close > MA2 AND Ref(Close, -1) > Ref(MA1, -1)
+                                       AND Ref(Close, -1) > Ref(MA2, -1);
+
+// Doc setup 3: "1 green candle which is touching either 10dema or 20dema or
+// both & closing above both".
+GreenTouch = IsGreen AND (Low <= MA1 OR Low <= MA2) AND Close > MA1 AND Close > MA2;
+RedTouch   = IsRed   AND (High >= MA1 OR High >= MA2) AND Close < MA1 AND Close < MA2;
+
+// Doc setup 7: "Stock should give a good surge (>1%, bigger the better)". The
+// doc does not say whether that is measured as a directional move or as the
+// span of the 3-candle window. The window span is used here — a reversal
+// pattern ends with the move partly retraced, so a net close-to-close reading
+// understates exactly the setups this is meant to find.
+Range3  = (HHV(High, 3) - LLV(Low, 3)) / Max(Close, 0.000001) * 100;
+BigMove = Range3 >= SurgePct;
+
+// ---- SECTION 3: THE STATE MACHINE ----------------------------------------
+// Everything below is path-dependent — which candle was the day's first, which
+// had the lowest volume so far, whether a setup has already fired today — so it
+// runs as a bar loop rather than as array expressions. One loop rather than six
+// because the setups interact: setup 2 cancels setup 1, and both read the same
+// running lowest-volume candle.
+//
+// Only CLOSED candles are evaluated. During the session BarCount-1 is still
+// forming: its high, low and volume can all still change, so a setup that reads
+// them can un-fire before the bar ends.
+lastBar = BarCount - 1;
+while (lastBar > 0 AND Volume[lastBar] == 0)
+    lastBar = lastBar - 1;      // skip zero-volume pad bars from "Pad & align"
+
+lastClosed = lastBar - 1;
+while (lastClosed > 0 AND Volume[lastClosed] == 0)
+    lastClosed = lastClosed - 1;
+
+EvalBar = 0 * Close;
+if (lastClosed >= 0)
+    EvalBar[lastClosed] = 1;
+
+// Output arrays. SigState 1 = ARMED (order should be resting), 2 = FIRED (a
+// closed bar traded through the level).
+SigDir   = 0 * Close;       // +1 buy, -1 sell
+SigSetup = 0 * Close;
+SigState = 0 * Close;
+SigEntry = 0 * Close;
+SigStop  = 0 * Close;
+BarIdxA  = 0 * Close;       // bar's index within its own day, for the diagnostic
+
+// Per-setup flags, kept as arrays purely so the diagnostic can show them.
+A1 = 0 * Close;  A2 = 0 * Close;  A3 = 0 * Close;
+A6 = 0 * Close;  A7 = 0 * Close;  A9 = 0 * Close;
+
+DayNum = DateNum();
+
+barIdx  = -1;
+dayHigh = 0;   dayLow = 0;
+prevDayHigh = 0;   prevDayLow = 0;   // running extremes EXCLUDING the current bar
+minVol  = 0;   mvHigh = 0;   mvLow = 0;   mvRed = 0;
+redCount = 0;  greenCount = 0;
+
+c1o = 0; c1h = 0; c1l = 0; c1c = 0; c1m1 = 0; c1m2 = 0;
+c2h = 0; c2l = 0; c2c = 0; c2o = 0;
+
+s1Trig = 0; s1Dead = 0; s2Trig = 0; s6Trig = 0; s9Trig = 0;
+s1TrigS = 0; s1DeadS = 0; s2TrigS = 0; s9TrigS = 0;
+
+s3BaseHigh = 0; s3BaseSet = 0; s3Plays = 0; s3LiveStop = 0; s3Live = 0;
+s3BaseLow = 0; s3BaseSetS = 0; s3PlaysS = 0; s3LiveStopS = 0; s3LiveS = 0;
+
+for (i = 1; i <= lastClosed; i++)
+{
+    newDay = DayNum[i] != DayNum[i - 1];
+
+    if (newDay)
+    {
+        barIdx = 0;
+        dayHigh = High[i];   dayLow = Low[i];
+        prevDayHigh = 0;     prevDayLow = 0;
+        minVol = Volume[i];  mvHigh = High[i];  mvLow = Low[i];
+        mvRed = IsRed[i];
+        redCount = 0;  greenCount = 0;
+        if (IsRed[i])   redCount = 1;
+        if (IsGreen[i]) greenCount = 1;
+
+        c1o = Open[i];  c1h = High[i];  c1l = Low[i];  c1c = Close[i];
+        c1m1 = MA1[i];  c1m2 = MA2[i];
+        c2h = 0; c2l = 0; c2c = 0; c2o = 0;
+
+        s1Trig = 0; s1Dead = 0; s2Trig = 0; s6Trig = 0; s9Trig = 0;
+        s1TrigS = 0; s1DeadS = 0; s2TrigS = 0; s9TrigS = 0;
+        s3BaseSet = 0; s3BaseHigh = 0; s3Plays = 0; s3Live = 0; s3LiveStop = 0;
+        s3BaseSetS = 0; s3BaseLow = 0; s3PlaysS = 0; s3LiveS = 0; s3LiveStopS = 0;
+    }
+    else
+    {
+        barIdx = barIdx + 1;
+        // Captured BEFORE this bar folds into the running extreme, because the
+        // setup-1 trigger is "above the day high" — meaning the high of
+        // everything that came before, not one that includes the bar being
+        // tested against it.
+        prevDayHigh = dayHigh;
+        prevDayLow  = dayLow;
+        dayHigh = Max(dayHigh, High[i]);
+        dayLow  = Min(dayLow, Low[i]);
+
+        if (IsRed[i])   redCount = redCount + 1;
+        if (IsGreen[i]) greenCount = greenCount + 1;
+
+        // Doc setup 2 invalidation: "After formation of lowest volume red candle
+        // if green candle is formed which has further lower volume then set up
+        // becomes invalid". Tracking colour alongside the running minimum is
+        // what implements that — when a green candle takes over as the day's
+        // quietest, mvRed goes false and setup 2 disarms by itself.
+        if (Volume[i] < minVol)
+        {
+            minVol = Volume[i];  mvHigh = High[i];  mvLow = Low[i];
+            mvRed = IsRed[i];
+        }
+
+        if (barIdx == 1)
+        {
+            c2o = Open[i];  c2h = High[i];  c2l = Low[i];  c2c = Close[i];
+        }
+    }
+
+    BarIdxA[i] = barIdx;
+
+    if (TwoBelow[i])
+        s1Dead = 1;
+    if (TwoAbove[i])
+        s1DeadS = 1;
+
+    notExpired = barIdx < MaxEntryBars;
+
+    // Nothing below can act on the day's first candle: every setup needs at
+    // least one completed candle behind it.
+    if (barIdx >= 1)
+    {
+        // ---- SETUP 1 --------------------------------------------------------
+        // Doc: "select those stocks for buy whose first candle is Green &
+        // closed above previous day high and also above 10dema and 20dema ...
+        // At sharp 0925 algo will place buy order above day high (AT 0925) once
+        // order executes SL will be placed below 0925 candle."
+        s1Select = ShowS1 AND DirBuy AND c1c > c1o AND c1c > PDH[i]
+                   AND c1c > c1m1 AND c1c > c1m2;
+
+        // [DOC FIX] barIdx >= 2, not >= 1. The stop is the 0925 candle's low,
+        // and that candle is barIdx 1 — its low is not final until it closes.
+        // The Pine allowed setup 1 to trigger DURING that candle, which prices
+        // the entry against a stop nobody could have placed yet. The doc puts
+        // the order in at 09:25, after both candles are complete. Setup 6 in the
+        // same Pine file already required barIdx >= 2; setup 1 did not.
+        minBar1 = 2;
+        if (S1SLUse0925 == 0)
+            minBar1 = 1;        // stop from the 1st candle is final a bar earlier
+
+        buy1 = prevDayHigh + tick;
+        sl1  = c1l - tick;
+        if (S1SLUse0925 == 1)
+            sl1 = c2l - tick;
+        slPct1 = 0;
+        if (buy1 > 0)
+            slPct1 = (buy1 - sl1) / buy1 * 100;
+
+        // [DOC FIX] NOT s2Trig. Doc: "Once set up 2 is found that will get
+        // priority over set up-1" and "algo will place order as per set up-2 and
+        // cancel order through set up 1". The Pine blocked setup 2 once setup 1
+        // had fired but never the reverse, so both could open a position on the
+        // same stock on the same day.
+        s1OK = s1Select AND barIdx >= minBar1 AND NOT s1Dead AND NOT s1Trig
+               AND NOT s2Trig AND notExpired AND slPct1 <= SLMaxPct AND sl1 > 0;
+
+        if (s1OK)
+        {
+            A1[i] = 1;
+            if (High[i] >= buy1)
+            {
+                SigDir[i] = 1; SigSetup[i] = 1; SigState[i] = 2;
+                SigEntry[i] = buy1; SigStop[i] = sl1;
+                s1Trig = 1;
+            }
+            else
+            {
+                if (SigState[i] == 0)
+                {
+                    SigDir[i] = 1; SigSetup[i] = 1; SigState[i] = 1;
+                    SigEntry[i] = buy1; SigStop[i] = sl1;
+                }
+            }
+        }
+
+        // Sell mirror — doc: "sell whose first candle is Red & closed below
+        // previous day low and also below 10dema and 20dema".
+        s1SelectS = ShowS1 AND DirSell AND c1c < c1o AND c1c < PDL[i]
+                    AND c1c < c1m1 AND c1c < c1m2;
+        sell1 = prevDayLow - tick;
+        sl1s  = c1h + tick;
+        if (S1SLUse0925 == 1)
+            sl1s = c2h + tick;
+        slPct1s = 0;
+        if (sell1 > 0)
+            slPct1s = (sl1s - sell1) / sell1 * 100;
+
+        s1OKs = s1SelectS AND barIdx >= minBar1 AND NOT s1DeadS AND NOT s1TrigS
+                AND NOT s2TrigS AND notExpired AND slPct1s <= SLMaxPct AND sell1 > 0;
+
+        if (s1OKs)
+        {
+            A1[i] = 1;
+            if (Low[i] <= sell1)
+            {
+                SigDir[i] = -1; SigSetup[i] = 1; SigState[i] = 2;
+                SigEntry[i] = sell1; SigStop[i] = sl1s;
+                s1TrigS = 1;
+            }
+            else
+            {
+                if (SigState[i] == 0)
+                {
+                    SigDir[i] = -1; SigSetup[i] = 1; SigState[i] = 1;
+                    SigEntry[i] = sell1; SigStop[i] = sl1s;
+                }
+            }
+        }
+
+        // ---- SETUP 2 --------------------------------------------------------
+        // Doc: "Buy above opposite color candle of lowest volume of the day ...
+        // Only those stocks are selected for set up-2 which were selected for
+        // set up-1 ... as soon as 2nd red candle is formed, algo will start
+        // looking for red candle which has lowest volume of the day."
+        //
+        // Setup 2 takes priority over setup 1 and is therefore evaluated after
+        // it, overwriting the bar's signal when both are live.
+        s2Armed = ShowS2 AND DirBuy AND s1Select AND NOT s1Trig AND NOT s2Trig
+                  AND redCount >= 2 AND mvRed;
+        if (s2Armed)
+        {
+            buy2 = mvHigh + tick;
+            sl2  = mvLow - tick;
+            A2[i] = 1;
+            if (High[i] >= buy2)
+            {
+                SigDir[i] = 1; SigSetup[i] = 2; SigState[i] = 2;
+                SigEntry[i] = buy2; SigStop[i] = sl2;
+                s2Trig = 1;
+            }
+            else
+            {
+                SigDir[i] = 1; SigSetup[i] = 2; SigState[i] = 1;
+                SigEntry[i] = buy2; SigStop[i] = sl2;
+            }
+        }
+
+        s2ArmedS = ShowS2 AND DirSell AND s1SelectS AND NOT s1TrigS AND NOT s2TrigS
+                   AND greenCount >= 2 AND NOT mvRed;
+        if (s2ArmedS)
+        {
+            sell2 = mvLow - tick;
+            sl2s  = mvHigh + tick;
+            A2[i] = 1;
+            if (Low[i] <= sell2)
+            {
+                SigDir[i] = -1; SigSetup[i] = 2; SigState[i] = 2;
+                SigEntry[i] = sell2; SigStop[i] = sl2s;
+                s2TrigS = 1;
+            }
+            else
+            {
+                SigDir[i] = -1; SigSetup[i] = 2; SigState[i] = 1;
+                SigEntry[i] = sell2; SigStop[i] = sl2s;
+            }
+        }
+
+        // ---- SETUP 6 --------------------------------------------------------
+        // Doc: "for those stocks only which are gapped up or gapped down more
+        // than 3%. For gapped stocks if first 2 candles are red, sell below
+        // 09:25 low & SL above 09:25 candle. For gapped down if 2 candles are
+        // green buy above 09:25 high & SL below 09:25 candle. In any case if 2nd
+        // candle is bigger and SL becoming more than 1%, system will not take
+        // the trade."
+        if (barIdx >= 2 AND PDC[i] > 0)
+        {
+            gapPct = (c1o - PDC[i]) / PDC[i] * 100;
+
+            buy6 = c2h + tick;
+            sl6  = c2l - tick;
+            slPct6 = 0;
+            if (buy6 > 0)
+                slPct6 = (buy6 - sl6) / buy6 * 100;
+            s6BuyOK = ShowS6 AND DirBuy AND gapPct <= -GapThresh
+                      AND c1c > c1o AND c2c > c2o AND NOT s6Trig
+                      AND slPct6 <= SLMaxPct;
+
+            if (s6BuyOK)
+            {
+                A6[i] = 1;
+                if (High[i] >= buy6)
+                {
+                    SigDir[i] = 1; SigSetup[i] = 6; SigState[i] = 2;
+                    SigEntry[i] = buy6; SigStop[i] = sl6;
+                    s6Trig = 1;
+                }
+                else
+                {
+                    if (SigState[i] == 0)
+                    {
+                        SigDir[i] = 1; SigSetup[i] = 6; SigState[i] = 1;
+                        SigEntry[i] = buy6; SigStop[i] = sl6;
+                    }
+                }
+            }
+
+            sell6 = c2l - tick;
+            sl6s  = c2h + tick;
+            slPct6s = 0;
+            if (sell6 > 0)
+                slPct6s = (sl6s - sell6) / sell6 * 100;
+            s6SellOK = ShowS6 AND DirSell AND gapPct >= GapThresh
+                       AND c1c < c1o AND c2c < c2o AND NOT s6Trig
+                       AND slPct6s <= SLMaxPct;
+
+            if (s6SellOK)
+            {
+                A6[i] = 1;
+                if (Low[i] <= sell6)
+                {
+                    SigDir[i] = -1; SigSetup[i] = 6; SigState[i] = 2;
+                    SigEntry[i] = sell6; SigStop[i] = sl6s;
+                    s6Trig = 1;
+                }
+                else
+                {
+                    if (SigState[i] == 0)
+                    {
+                        SigDir[i] = -1; SigSetup[i] = 6; SigState[i] = 1;
+                        SigEntry[i] = sell6; SigStop[i] = sl6s;
+                    }
+                }
+            }
+        }
+
+        // ---- SETUP 9 --------------------------------------------------------
+        // Doc: "In case candle is closing above day high & 10/20 dma but first
+        // candle is not green ... If first candle is dozy or red but subsequent
+        // candles close above this candle, then system will ignore dozy or red
+        // candle and trade it as per set up-1."
+        s9Select = ShowS9 AND DirBuy AND c1c <= c1o AND c1c > PDH[i]
+                   AND c1c > c1m1 AND c1c > c1m2;
+        if (s9Select AND Close[i] > c1h AND NOT s9Trig AND notExpired)
+        {
+            buy9 = prevDayHigh + tick;
+            sl9  = c1l - tick;
+            slPct9 = 0;
+            if (buy9 > 0)
+                slPct9 = (buy9 - sl9) / buy9 * 100;
+            if (slPct9 <= SLMaxPct AND sl9 > 0)
+            {
+                A9[i] = 1;
+                if (High[i] >= buy9)
+                {
+                    if (SigState[i] < 2)
+                    {
+                        SigDir[i] = 1; SigSetup[i] = 9; SigState[i] = 2;
+                        SigEntry[i] = buy9; SigStop[i] = sl9;
+                    }
+                    s9Trig = 1;
+                }
+                else
+                {
+                    if (SigState[i] == 0)
+                    {
+                        SigDir[i] = 1; SigSetup[i] = 9; SigState[i] = 1;
+                        SigEntry[i] = buy9; SigStop[i] = sl9;
+                    }
+                }
+            }
+        }
+
+        s9SelectS = ShowS9 AND DirSell AND c1c >= c1o AND c1c < PDL[i]
+                    AND c1c < c1m1 AND c1c < c1m2;
+        if (s9SelectS AND Close[i] < c1l AND NOT s9TrigS AND notExpired)
+        {
+            sell9 = prevDayLow - tick;
+            sl9s  = c1h + tick;
+            slPct9s = 0;
+            if (sell9 > 0)
+                slPct9s = (sl9s - sell9) / sell9 * 100;
+            if (slPct9s <= SLMaxPct AND sell9 > 0)
+            {
+                A9[i] = 1;
+                if (Low[i] <= sell9)
+                {
+                    if (SigState[i] < 2)
+                    {
+                        SigDir[i] = -1; SigSetup[i] = 9; SigState[i] = 2;
+                        SigEntry[i] = sell9; SigStop[i] = sl9s;
+                    }
+                    s9TrigS = 1;
+                }
+                else
+                {
+                    if (SigState[i] == 0)
+                    {
+                        SigDir[i] = -1; SigSetup[i] = 9; SigState[i] = 1;
+                        SigEntry[i] = sell9; SigStop[i] = sl9s;
+                    }
+                }
+            }
+        }
+
+        // ---- SETUP 7 --------------------------------------------------------
+        // Doc: "combination of 3 candles. Stock should give a good surge. In
+        // bullish reversal one of the two red candles should have lowest volume
+        // of the day."
+        //
+        // Read against the worked demo rather than that sentence alone, because
+        // the sentence admits several readings and the demo does not: "3rd
+        // candle is green and till now have lowest volume, it sensed set up-7
+        // and place a sell call below 2nd candle", and again "5th green candle
+        // is lowest volume of the day ... place SL below 4th candle". So the
+        // CURRENT candle is the day's quietest, the PREVIOUS one shares its
+        // colour, and the trade breaks the previous candle with the stop beyond
+        // the current one.
+        //
+        // The Pine implemented exactly this — but its own header comment above
+        // the code described something different ("2 prior candles RED + current
+        // GREEN reversal"), which is worth knowing if you compare the two.
+        curIsLowVol = Volume[i] <= minVol;
+        if (BigMove[i] AND curIsLowVol AND barIdx >= 2)
+        {
+            if (ShowS7 AND DirBuy AND mvRed AND IsRed[i - 1])
+            {
+                A7[i] = 1;
+                if (SigState[i] == 0)
+                {
+                    SigDir[i] = 1; SigSetup[i] = 7; SigState[i] = 1;
+                    SigEntry[i] = High[i - 1] + tick;
+                    SigStop[i]  = Low[i] - tick;
+                }
+            }
+            if (ShowS7 AND DirSell AND NOT mvRed AND IsGreen[i - 1])
+            {
+                A7[i] = 1;
+                if (SigState[i] == 0)
+                {
+                    SigDir[i] = -1; SigSetup[i] = 7; SigState[i] = 1;
+                    SigEntry[i] = Low[i - 1] - tick;
+                    SigStop[i]  = High[i] + tick;
+                }
+            }
+        }
+
+        // ---- SETUP 3 --------------------------------------------------------
+        // Doc: "algo will look for 1 green candle which is touching either
+        // 10dema or 20dema or both & closing above both. It should be followed
+        // by another green candle, which is closing above high of previous
+        // candle. Buy above this 2nd candle and SL below same candle."
+        //
+        // [DOC FIX] "This set up can be played twice in same stock ... if second
+        // time also SL hit then abort the trade" — the Pine had no counter at
+        // all and would re-arm indefinitely. s3Plays caps it.
+        //
+        // A touch candle always becomes a NEW base rather than a confirmation,
+        // so one bar cannot be both halves of the pattern. The doc does not say
+        // this outright, but "followed by another green candle" requires two.
+        if (s3Live AND Low[i] <= s3LiveStop)
+            s3Live = 0;             // stop hit — the play is over, count stands
+
+        s3Confirm = ShowS3 AND DirBuy AND s3BaseSet AND IsGreen[i]
+                    AND Close[i] > s3BaseHigh AND NOT GreenTouch[i]
+                    AND s3Plays < S3MaxPlays;
+        if (s3Confirm)
+        {
+            A3[i] = 1;
+            if (SigState[i] == 0)
+            {
+                SigDir[i] = 1; SigSetup[i] = 3; SigState[i] = 1;
+                SigEntry[i] = High[i] + tick;
+                SigStop[i]  = Low[i] - tick;
+            }
+            s3Plays = s3Plays + 1;
+            s3Live = 1;
+            s3LiveStop = Low[i] - tick;
+            s3BaseSet = 0;
+        }
+        if (GreenTouch[i])
+        {
+            s3BaseHigh = High[i];
+            s3BaseSet = 1;
+        }
+
+        if (s3LiveS AND High[i] >= s3LiveStopS)
+            s3LiveS = 0;
+
+        s3ConfirmS = ShowS3 AND DirSell AND s3BaseSetS AND IsRed[i]
+                     AND Close[i] < s3BaseLow AND NOT RedTouch[i]
+                     AND s3PlaysS < S3MaxPlays;
+        if (s3ConfirmS)
+        {
+            A3[i] = 1;
+            if (SigState[i] == 0)
+            {
+                SigDir[i] = -1; SigSetup[i] = 3; SigState[i] = 1;
+                SigEntry[i] = Low[i] - tick;
+                SigStop[i]  = High[i] + tick;
+            }
+            s3PlaysS = s3PlaysS + 1;
+            s3LiveS = 1;
+            s3LiveStopS = High[i] + tick;
+            s3BaseSetS = 0;
+        }
+        if (RedTouch[i])
+        {
+            s3BaseLow = Low[i];
+            s3BaseSetS = 1;
+        }
+    }
+}
+
+Buy   = SigDir ==  1 AND SigState == 2;
+Sell  = SigDir == -1 AND SigState == 2;
+Fired = SigState == 2;
+Armed = SigState == 1;
+
+RiskPts = 0 * Close;
+RiskPts = IIf(SigDir ==  1, SigEntry - SigStop,
+          IIf(SigDir == -1, SigStop - SigEntry, 0));
+RiskPct = IIf(SigEntry > 0, RiskPts / SigEntry * 100, 0);
+
+// ---- SECTION 4: EXPLORATION ----------------------------------------------
+if (DiagMode == 1)
+    Filter = EvalBar;                       // one row per symbol, last closed bar
+else
+{
+    Filter = Fired;
+    if (ShowArmed == 1)
+        Filter = Fired OR Armed;
+}
+
+AddTextColumn(WriteIf(SigState == 2, "** FIRED **",
+              WriteIf(SigState == 1, "armed", "")), "Status");
+AddTextColumn(WriteIf(SigDir == 1, "BUY", WriteIf(SigDir == -1, "SELL", "")), "Side");
+AddColumn(SigSetup, "Setup", 1.0);
+AddColumn(DateTime(), "Bar", formatDateTime);
+AddColumn(BarIdxA, "Bar #", 1.0);
+AddColumn(Close, "Close", 1.2);
+AddColumn(SigEntry, "Entry", 1.2);
+AddColumn(SigStop, "Stop", 1.2);
+AddColumn(RiskPct, "Risk %", 1.2);
+
+if (DiagMode == 1)
+{
+    // Which setups were live on this bar, independent of which one won the row.
+    AddTextColumn(WriteIf(A1, "1 ", "") + WriteIf(A2, "2 ", "")
+                + WriteIf(A3, "3 ", "") + WriteIf(A6, "6 ", "")
+                + WriteIf(A7, "7 ", "") + WriteIf(A9, "9 ", ""), "Live Setups");
+
+    AddColumn(PDH, "PDH", 1.2);
+    AddColumn(PDL, "PDL", 1.2);
+    AddColumn(MA1, "MA" + NumToStr(MALen1, 1.0), 1.2);
+    AddColumn(MA2, "MA" + NumToStr(MALen2, 1.0), 1.2);
+    AddColumn(Range3, "3-bar Range %", 1.2);
+    AddColumn(BarCount, "Bars Avail", 1.0);
+
+    // Lifetime counts, so "no signal today" is distinguishable from "this
+    // formula has never fired on this symbol" — the two look identical on a
+    // per-bar view and that is what makes a quiet scan impossible to debug.
+    AddColumn(Cum(IIf(Fired, 1, 0)), "Ever Fired", 1.0);
+    AddColumn(Cum(IIf(Armed, 1, 0)), "Ever Armed", 1.0);
+}
+
+AddTextColumn(WriteIf(TF_OK, "", "WRONG TF — use 1, 3 or 5 min"), "TF Check");
+
+// ---- SECTION 5: CHART -----------------------------------------------------
+SetChartOptions(0, chartShowArrows | chartShowDates);
+Plot(Close, "Price", colorDefault, styleCandle);
+Plot(MA1, "MA" + NumToStr(MALen1, 1.0), colorAqua, styleLine | styleThick);
+Plot(MA2, "MA" + NumToStr(MALen2, 1.0), colorOrange, styleLine | styleThick);
+Plot(PDH, "PDH", colorGrey50, styleLine | styleDashed);
+Plot(PDL, "PDL", colorGrey50, styleLine | styleDashed);
+
+Plot(IIf(SigState > 0, SigEntry, Null), "Entry", colorBrightGreen,
+     styleDots | styleNoLine | styleNoRescale);
+Plot(IIf(SigState > 0, SigStop, Null),  "Stop",  colorRed,
+     styleDots | styleNoLine | styleNoRescale);
+
+PlotShapes(IIf(Buy,  shapeUpArrow,   shapeNone), colorBrightGreen, 0, Low,  -30);
+PlotShapes(IIf(Sell, shapeDownArrow, shapeNone), colorRed,         0, High,  30);
+PlotShapes(IIf(Armed AND SigDir ==  1, shapeSmallCircle, shapeNone),
+           colorLime,   0, Low,  -20);
+PlotShapes(IIf(Armed AND SigDir == -1, shapeSmallCircle, shapeNone),
+           colorOrange, 0, High,  20);
+
+Title = Name() + "  " + Date()
+      + "   bar #" + NumToStr(BarIdxA, 1.0)
+      + "   C=" + NumToStr(Close, 1.2)
+      + "   PDH " + NumToStr(PDH, 1.2) + " / PDL " + NumToStr(PDL, 1.2)
+      + "\n" + WriteIf(SigState == 2, "FIRED", WriteIf(SigState == 1, "ARMED", "—"))
+      + "  setup " + NumToStr(SigSetup, 1.0)
+      + WriteIf(SigDir == 1, "  BUY", WriteIf(SigDir == -1, "  SELL", ""))
+      + "  entry " + NumToStr(SigEntry, 1.2)
+      + "  stop " + NumToStr(SigStop, 1.2)
+      + "  risk " + NumToStr(RiskPct, 1.2) + "%"
+      + "\nlive: " + WriteIf(A1, "S1 ", "") + WriteIf(A2, "S2 ", "")
+      + WriteIf(A3, "S3 ", "") + WriteIf(A6, "S6 ", "")
+      + WriteIf(A7, "S7 ", "") + WriteIf(A9, "S9 ", "");
+
+_SECTION_END();

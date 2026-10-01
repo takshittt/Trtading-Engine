@@ -1,0 +1,24 @@
+// ============================================================
+// indicators.afl — shared indicator arrays ONLY. No Buy/Sell here.
+// Expects: tn, newDay (defined in main.afl)
+// ============================================================
+
+// Levels of the first candle (9:15), held for the rest of the day
+FC_High  = ValueWhen(tn == 91500, High);
+FC_Low   = ValueWhen(tn == 91500, Low);
+FC_Open  = ValueWhen(tn == 91500, Open);
+FC_Close = ValueWhen(tn == 91500, Close);
+
+// Previous day OHLC
+PD_High  = TimeFrameGetPrice("H", inDaily, -1);
+PD_Low   = TimeFrameGetPrice("L", inDaily, -1);
+PD_Close = TimeFrameGetPrice("C", inDaily, -1);
+
+// Gap % at today's open vs previous close
+DayOpen = ValueWhen(newDay, Open);
+GapPct  = (DayOpen - PD_Close) / PD_Close * 100;
+
+// Intraday VWAP (resets daily)
+barsToday = BarsSince(newDay) + 1;
+tp   = (High + Low + Close) / 3;
+VWAP_ = Sum(tp * Volume, barsToday) / Sum(Volume, barsToday);
