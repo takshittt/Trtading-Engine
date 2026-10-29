@@ -36,16 +36,16 @@ else:
     # doesn't surface as "server has gone away"; the SQLite-only connect args
     # (check_same_thread / timeout) must not be passed here.
     #
-    # pool_size/max_overflow are sized for the off-site DB (~35ms RTT), not
-    # SQLAlchemy's local-DB defaults (5 + 10 overflow = 15 total). Most routes
-    # in api/routes.py are plain `def` on purpose (see the note there) so they
-    # run concurrently in the thread pool — several dashboard panels each
-    # polling their own endpoint every second can hold several connections
-    # checked out at once even though the tables themselves are tiny, and the
-    # old defaults made the rest queue for a free connection behind them.
+    # Minimal pool: the DB is a small self-hosted Postgres on the private
+    # network (~0.5ms RTT, 1GB RAM shared by all three backends), so only 2
+    # connections are kept open. Most routes in api/routes.py are plain `def`
+    # on purpose (see the note there) so they run concurrently in the thread
+    # pool alongside the engine loops — the overflow gives those bursts
+    # headroom instead of queueing them, and overflow connections are closed
+    # on return, so they cost nothing while idle.
     engine = create_engine(
         settings.database_url, pool_pre_ping=True, pool_recycle=3600,
-        pool_size=20, max_overflow=40, pool_timeout=30,
+        pool_size=2, max_overflow=8, pool_timeout=30,
     )
 
 

@@ -19,17 +19,17 @@ else:
     # doesn't surface as "server has gone away"; check_same_thread is a
     # SQLite-only connect arg and must not be passed here.
     #
-    # pool_size/max_overflow are sized for a remote DB (~35ms RTT), not the
-    # old local SQLite file: several browser tabs each polling /api/state,
-    # /api/funds, /api/positions, /api/orders concurrently — plus a broker
-    # login doing its own sequential session-cache round trips in a worker
-    # thread — can hold several connections checked out at once. The old
-    # defaults (5 + 10 overflow) queued requests behind each other, which
-    # read as "login/page refresh is slow" once every query carries network
-    # latency instead of being effectively free.
+    # Minimal pool: the DB is a small self-hosted Postgres on the private
+    # network (~0.5ms RTT, 1GB RAM shared by all three backends), so queries
+    # return their connection almost immediately and only 2 are kept open.
+    # The overflow stays non-zero because a broker login holds a connection
+    # through its sequential session-cache round trips — with no headroom,
+    # concurrent dashboard polls (/api/state, /api/funds, /api/positions...)
+    # would queue behind it for up to pool_timeout. Overflow connections are
+    # closed on return, so they cost nothing while idle.
     engine = create_engine(
         DATABASE_URL, pool_pre_ping=True, pool_recycle=3600,
-        pool_size=20, max_overflow=40, pool_timeout=30,
+        pool_size=2, max_overflow=8, pool_timeout=30,
     )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)

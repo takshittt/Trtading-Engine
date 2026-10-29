@@ -37,8 +37,11 @@ if IS_SQLITE:
 else:
     # MySQL/Postgres: pre_ping + recycle so a long-idle pooled connection doesn't
     # surface as "server has gone away". No SQLite-only connect args here.
+    # Minimal pool (2 kept open, bursts up to 7): the DB is a small Postgres
+    # shared by all three backends; overflow connections close on return.
     _engine = create_engine(
         DATABASE_URL, pool_pre_ping=True, pool_recycle=3600, future=True,
+        pool_size=2, max_overflow=5,
     )
 
 SessionLocal = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False)
