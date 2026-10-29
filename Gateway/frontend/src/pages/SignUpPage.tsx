@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
+import './auth.css'
 
 export default function SignUpPage() {
   const { signup } = useAuth()
@@ -35,27 +36,23 @@ export default function SignUpPage() {
   }
 
   return (
-    <AuthShell title="Create your account" subtitle="Sign up to configure your broker and access the gateway.">
-      <form onSubmit={handleSubmit} className="space-y-4">
-        {error && (
-          <div className="bg-red-950/60 border border-red-800 text-red-300 text-sm px-4 py-3 rounded-lg">
-            {error}
-          </div>
-        )}
-        <Field label="Email" type="email" value={email} onChange={setEmail} autoFocus placeholder="you@example.com" />
-        <Field label="Password" type="password" value={password} onChange={setPassword} placeholder="At least 6 characters" />
-        <Field label="Confirm password" type="password" value={confirm} onChange={setConfirm} placeholder="Re-enter password" />
+    <AuthShell title="Create your account" subtitle="Next you will add your broker login, then you can start trading through the gateway.">
+      <form onSubmit={handleSubmit} className="bauth-form">
+        {error && <AuthError message={error} />}
+        <Field label="Email" type="email" value={email} onChange={setEmail} autoFocus autoComplete="username" placeholder="you@example.com" />
+        <Field label="Password" type="password" value={password} onChange={setPassword} autoComplete="new-password" placeholder="At least 6 characters" />
+        <Field label="Confirm password" type="password" value={confirm} onChange={setConfirm} autoComplete="new-password" placeholder="Re-enter password" />
         <button
           type="submit"
           disabled={busy}
-          className="w-full px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium transition-colors cursor-pointer"
+          className="bauth-btn"
         >
           {busy ? 'Creating account…' : 'Sign up'}
         </button>
       </form>
-      <p className="text-sm text-gray-500 text-center mt-6">
+      <p className="bauth-alt">
         Already have an account?{' '}
-        <Link to="/signin" className="text-blue-400 hover:text-blue-300">Sign in</Link>
+        <Link to="/signin">Sign in</Link>
       </p>
     </AuthShell>
   )
@@ -73,20 +70,41 @@ export function AuthShell({
   children: React.ReactNode
 }) {
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center px-4">
-      <div className="w-full max-w-md">
-        <div className="flex items-center gap-3 justify-center mb-8">
-          <div className="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center font-bold select-none">G</div>
-          <span className="font-semibold tracking-tight text-lg">Gateway</span>
+    <div className="bauth">
+      <aside className="bauth-aside">
+        <Link className="bauth-brand" to="/">
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <path fill="currentColor" d="M3.5 18.5V14c0-2 1.3-3.4 3.2-3.6C8 7.2 10.8 5 14.3 5c3.6 0 5.8 2.2 8.7 4.4 2.8.6 5 2.6 5 5.8V26h-2.6l-.6-6h-2.3l-.4 6h-2.6l-.4-5.6h-5.2l-.4 5.6H11l-.4-4.6H9.2c-1.4 0-2.4-.8-2.9-2l-.5-.4z" />
+            <path fill="var(--aside-accent)" d="M7.6 10.6c-1.4-1-1.8-2.6-1.1-4.2.4 1.2 1.2 1.9 2.4 2.3z" />
+          </svg>
+          Bison <span className="bauth-product">Gateway</span>
+        </Link>
+        <div className="bauth-pitch">
+          <span className="bauth-eyebrow">Self-hosted execution for NSE &amp; MCX</span>
+          <h2>One broker session. <em>Every strategy.</em></h2>
+          <ul className="bauth-points">
+            <li><b>1</b>Shoonya login, shared by Grid and Reversal</li>
+            <li><b>60s</b>Positions checked against your broker</li>
+            <li><b>7d</b>Sign-in lasts a week on this device</li>
+          </ul>
         </div>
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-          <h1 className="text-lg font-semibold">{title}</h1>
-          <p className="text-sm text-gray-500 mt-1 mb-6">{subtitle}</p>
+        <p className="bauth-fine">Trading futures and options carries a high risk of loss. You are responsible for every order placed from your account.</p>
+      </aside>
+      <main className="bauth-main">
+        <div className="bauth-card">
+          <div className="bauth-head">
+            <h1>{title}</h1>
+            <p>{subtitle}</p>
+          </div>
           {children}
         </div>
-      </div>
+      </main>
     </div>
   )
+}
+
+export function AuthError({ message }: { message: string }) {
+  return <div className="bauth-error" role="alert">{message}</div>
 }
 
 export function Field({
@@ -96,6 +114,7 @@ export function Field({
   onChange,
   placeholder,
   autoFocus,
+  autoComplete,
 }: {
   label: string
   type?: string
@@ -103,17 +122,18 @@ export function Field({
   onChange: (v: string) => void
   placeholder?: string
   autoFocus?: boolean
+  autoComplete?: string
 }) {
   return (
-    <label className="block">
-      <span className="text-xs text-gray-400">{label}</span>
+    <label className="bauth-field">
+      <span>{label}</span>
       <input
         type={type}
         value={value}
         autoFocus={autoFocus}
+        autoComplete={autoComplete}
         placeholder={placeholder}
         onChange={e => onChange(e.target.value)}
-        className="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none placeholder:text-gray-600"
       />
     </label>
   )

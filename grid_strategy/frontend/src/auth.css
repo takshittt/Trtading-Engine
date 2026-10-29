@@ -1,0 +1,99 @@
+/* Bison auth screens (sign in / sign up / onboarding).
+   The same file is copied into Gateway, grid_strategy and reversal_strategy so all
+   three login screens match the landing page. Everything is scoped under .bauth and
+   uses literal colours, not Tailwind's palette, because the strategy dashboards remap
+   that palette for their dark themes. Keep the three copies identical. */
+.bauth {
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --ink: #141b2b;
+  --muted: #5a6478;
+  --line: #d3d9e3;
+  --field: #f6f8fb;
+  --accent: #c97a00;
+  --accent-soft: #fbe9c8;
+  --danger: #b4321a;
+  --danger-soft: #fdeae4;
+  --aside-bg: #141b2b;
+  --aside-ink: #e8ecf4;
+  --aside-muted: #94a0b8;
+  --aside-line: #2a344b;
+  --aside-accent: #f2a93b;
+  --display: "Big Shoulders Display", "Arial Narrow", "Helvetica Neue", sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 1rem/1.55 var(--body);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  .bauth {
+    --bg: #0e1422; --surface: #161e30; --ink: #e8ecf4; --muted: #94a0b8; --line: #2a344b;
+    --field: #0e1422; --accent: #f2a93b; --accent-soft: #3a2c14;
+    --danger: #f2784b; --danger-soft: #3a1c14;
+    --aside-bg: #090d17; --aside-line: #1f2839;
+    color-scheme: dark;
+  }
+}
+.bauth *, .bauth *::before, .bauth *::after { box-sizing: border-box; }
+
+/* left: brand panel */
+.bauth-aside {
+  background: var(--aside-bg); color: var(--aside-ink);
+  padding: 40px clamp(24px, 5vw, 64px);
+  display: flex; flex-direction: column; justify-content: space-between; gap: 48px;
+  min-width: 0;
+}
+.bauth-brand { display: flex; align-items: center; gap: 10px; font: 800 1.5rem/1 var(--display); text-transform: uppercase; letter-spacing: 0.04em; color: inherit; text-decoration: none; }
+.bauth-brand svg { width: 28px; height: 28px; flex: none; }
+.bauth-brand .bauth-product { color: var(--aside-muted); font-weight: 600; }
+.bauth-pitch { display: grid; gap: 20px; max-width: 30rem; }
+.bauth-eyebrow { font: 500 0.75rem/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--aside-muted); }
+.bauth-pitch h2 { margin: 0; font: 800 clamp(2.4rem, 4.6vw, 3.8rem)/0.98 var(--display); text-transform: uppercase; text-wrap: balance; }
+.bauth-pitch h2 em { font-style: normal; color: var(--aside-accent); }
+.bauth-points { list-style: none; margin: 0; padding: 0; display: grid; }
+.bauth-points li { display: grid; grid-template-columns: 4.5rem 1fr; gap: 12px; padding-block: 10px; border-top: 1px solid var(--aside-line); font-size: 0.92rem; color: var(--aside-muted); }
+.bauth-points li b { font: 800 1.35rem/1.1 var(--display); color: var(--aside-accent); font-variant-numeric: tabular-nums; }
+.bauth-fine { font-size: 0.75rem; color: var(--aside-muted); max-width: 30rem; margin: 0; }
+
+/* right: form */
+.bauth-main { display: grid; place-items: center; padding: 48px 20px; min-width: 0; }
+.bauth-card { width: 100%; max-width: 400px; display: grid; gap: 24px; }
+.bauth-head { display: grid; gap: 8px; }
+.bauth-head h1 { margin: 0; font: 800 2.4rem/1 var(--display); text-transform: uppercase; letter-spacing: 0.01em; }
+.bauth-head p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+.bauth-form { display: grid; gap: 16px; }
+.bauth-field { display: grid; gap: 6px; }
+.bauth-field > span { font: 500 0.72rem/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.bauth-field input, .bauth-field select {
+  width: 100%; font: 400 0.95rem/1.3 var(--body); color: var(--ink);
+  background: var(--field); border: 1px solid var(--line); border-radius: 6px;
+  padding: 11px 12px; appearance: auto;
+  color-scheme: inherit; /* reversal's index.css pins inputs to dark */
+}
+.bauth-field input::placeholder { color: var(--muted); opacity: 0.7; }
+.bauth-field input:focus, .bauth-field select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.bauth-btn {
+  width: 100%; margin-top: 4px; cursor: pointer;
+  font: 600 0.95rem/1 var(--body); padding: 13px 18px; border-radius: 6px;
+  border: 1px solid var(--ink); background: var(--ink); color: var(--bg);
+}
+.bauth-btn:hover:not(:disabled) { filter: brightness(1.15); }
+.bauth-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.bauth-btn:focus-visible, .bauth a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.bauth-error { border: 1px solid var(--danger); background: var(--danger-soft); color: var(--danger); border-radius: 6px; padding: 10px 12px; font-size: 0.88rem; }
+.bauth-alt { margin: 0; font-size: 0.9rem; color: var(--muted); }
+.bauth-alt a { color: var(--ink); font-weight: 600; text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+
+/* phone: brand panel shrinks to a header above the form */
+@media (max-width: 820px) {
+  .bauth { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .bauth-aside { padding: 20px; gap: 0; }
+  .bauth-pitch, .bauth-fine { display: none; }
+  .bauth-main { place-items: start center; padding-block: 36px; }
+}

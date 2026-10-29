@@ -1,9 +1,11 @@
 import { useState, type FormEvent } from 'react'
 import { login } from './auth'
+import './auth.css'
 
 /** grid's own sign-in. Credentials are verified against the Gateway (the
  * single identity provider) via grid's /api/auth/login proxy. Independent of
- * the Gateway's own browser session. */
+ * the Gateway's own browser session. Styled by auth.css, which is kept
+ * identical to the Gateway and Reversal copies. */
 export default function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -25,52 +27,61 @@ export default function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-800 flex items-center justify-center px-4">
-      <div className="w-full max-w-sm">
-        <div className="flex items-center gap-3 justify-center mb-8">
-          <div className="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center font-bold text-white select-none">S</div>
-          <span className="font-bold tracking-tight text-lg text-gray-900">Grid</span>
+    <div className="bauth">
+      <aside className="bauth-aside">
+        <div className="bauth-brand">
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <path fill="currentColor" d="M3.5 18.5V14c0-2 1.3-3.4 3.2-3.6C8 7.2 10.8 5 14.3 5c3.6 0 5.8 2.2 8.7 4.4 2.8.6 5 2.6 5 5.8V26h-2.6l-.6-6h-2.3l-.4 6h-2.6l-.4-5.6h-5.2l-.4 5.6H11l-.4-4.6H9.2c-1.4 0-2.4-.8-2.9-2l-.5-.4z" />
+            <path fill="var(--aside-accent)" d="M7.6 10.6c-1.4-1-1.8-2.6-1.1-4.2.4 1.2 1.2 1.9 2.4 2.3z" />
+          </svg>
+          Bison <span className="bauth-product">Grid</span>
         </div>
-        <form onSubmit={handleSubmit} className="bg-white border border-gray-200 rounded-xl p-6 space-y-4">
-          <div>
-            <h1 className="text-lg font-semibold text-gray-900">Sign in</h1>
-            <p className="text-sm text-gray-500 mt-1">Use your Gateway account.</p>
+        <div className="bauth-pitch">
+          <span className="bauth-eyebrow">Grid strategy · Dip ladder</span>
+          <h2>Buy the dips. <em>Exit every rung.</em></h2>
+          <ul className="bauth-points">
+            <li><b>1</b>Lot per rung, never averaged together</li>
+            <li><b>5</b>Checks on every tick before an exit fires</li>
+            <li><b>60s</b>Positions checked against your broker</li>
+          </ul>
+        </div>
+        <p className="bauth-fine">Trading futures and options carries a high risk of loss. You are responsible for every order placed from your account.</p>
+      </aside>
+      <main className="bauth-main">
+        <div className="bauth-card">
+          <div className="bauth-head">
+            <h1>Sign in</h1>
+            <p>Use your Gateway account to open the Grid dashboard.</p>
           </div>
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-lg">
-              {error}
-            </div>
-          )}
-          <label className="block">
-            <span className="text-xs text-gray-500">Email</span>
-            <input
-              type="email"
-              value={email}
-              autoFocus
-              placeholder="you@example.com"
-              onChange={e => setEmail(e.target.value)}
-              className="mt-1 w-full bg-gray-50 border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-800 focus:border-sky-500 focus:outline-none placeholder:text-gray-400"
-            />
-          </label>
-          <label className="block">
-            <span className="text-xs text-gray-500">Password</span>
-            <input
-              type="password"
-              value={password}
-              placeholder="Your password"
-              onChange={e => setPassword(e.target.value)}
-              className="mt-1 w-full bg-gray-50 border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-800 focus:border-sky-500 focus:outline-none placeholder:text-gray-400"
-            />
-          </label>
-          <button
-            type="submit"
-            disabled={busy}
-            className="w-full px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold transition-colors cursor-pointer"
-          >
-            {busy ? 'Signing in…' : 'Sign in'}
-          </button>
-        </form>
-      </div>
+          <form onSubmit={handleSubmit} className="bauth-form">
+            {error && <div className="bauth-error" role="alert">{error}</div>}
+            <label className="bauth-field">
+              <span>Email</span>
+              <input
+                type="email"
+                value={email}
+                autoFocus
+                autoComplete="username"
+                placeholder="you@example.com"
+                onChange={e => setEmail(e.target.value)}
+              />
+            </label>
+            <label className="bauth-field">
+              <span>Password</span>
+              <input
+                type="password"
+                value={password}
+                autoComplete="current-password"
+                placeholder="Your password"
+                onChange={e => setPassword(e.target.value)}
+              />
+            </label>
+            <button type="submit" disabled={busy} className="bauth-btn">
+              {busy ? 'Signing in…' : 'Sign in'}
+            </button>
+          </form>
+        </div>
+      </main>
     </div>
   )
 }

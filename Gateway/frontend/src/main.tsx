@@ -7,6 +7,7 @@ import { AuthProvider, useAuth } from './auth/AuthContext'
 import SignInPage from './pages/SignInPage'
 import SignUpPage from './pages/SignUpPage'
 import CredentialFormPage from './pages/CredentialFormPage'
+import LandingPage from './pages/LandingPage'
 
 function FullScreenLoader() {
   return (
@@ -32,13 +33,21 @@ function PublicOnly({ children }: { children: ReactNode }) {
   return <>{children}</>
 }
 
+/** Signed-out visitors get the landing page at "/"; signed-in users get the dashboard. */
+function Home() {
+  const { user, loading } = useAuth()
+  if (loading) return <FullScreenLoader />
+  if (!user) return <LandingPage />
+  return <App />
+}
+
 function AppRoutes() {
   return (
     <Routes>
       <Route path="/signin" element={<PublicOnly><SignInPage /></PublicOnly>} />
       <Route path="/signup" element={<PublicOnly><SignUpPage /></PublicOnly>} />
       <Route path="/form" element={<RequireAuth><CredentialFormPage /></RequireAuth>} />
-      <Route path="/" element={<RequireAuth><App /></RequireAuth>} />
+      <Route path="/" element={<Home />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
