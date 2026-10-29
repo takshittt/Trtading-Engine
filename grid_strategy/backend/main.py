@@ -29,6 +29,7 @@ class Runtime:
         self.engine = GridEngine()
         self._ws_clients: set[WebSocket] = set()
         self.engine.on_snapshot = self._broadcast_snapshot
+        self.engine.has_ui_clients = lambda: bool(self._ws_clients)
         event_log.on_event = self._broadcast_log
 
     async def start(self) -> None:

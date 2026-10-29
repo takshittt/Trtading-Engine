@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time as _time
 from datetime import date, datetime, time as dtime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
@@ -203,6 +203,11 @@ class GridEngine:
         self.ref_prices: dict[str, float] = {}
         self._session_suspect: bool = False                # latched while reads look unreadable
         self.broker_connected: bool = False
+        # Idle gating for the per-second DB loops (see _idle()). has_ui_clients
+        # is wired by main.Runtime to "is any dashboard WebSocket open"; the
+        # True default keeps the engine at full rate if nothing wires it.
+        self.has_ui_clients: Callable[[], bool] = lambda: True
+        self._has_live_lots: bool = True       # refreshed by each full price-keeper pass
         self.global_cb_tripped: bool = False
         self.feed_state: str = "down"                      # live | stale | down
         self._exit_cooldown: dict[int, float] = {}         # lot_id → monotonic ts of last exit try
@@ -3760,7 +3765,10 @@ class GridEngine:
     async def _rollover_loop(self) -> None:
         while True:
             try:
-                await self._rollover_check()
+                # Idle (no broker, no dashboard, no live lots): a roll can't be
+                # placed anyway, so don't re-read every instrument every 30s.
+                if not self._idle():
+                    await self._rollover_check()
             except Exception:
                 logger.exception("rollover check failed")
             await asyncio.sleep(settings.rollover_check_interval)
@@ -5307,6 +5315,16 @@ class GridEngine:
 
     # ================= price keeper / heartbeat / UI push =================
 
+    def _idle(self) -> bool:
+        """Nothing to watch: no broker, no dashboard open, no OPEN/TEMP_EXITED
+        lots. The per-second loops then slow to settings.idle_poll_interval
+        instead of re-reading the DB every second all night.
+
+        Open lots ALWAYS keep the full rate: "broker disconnected with open
+        positions" is exactly what _check_feed_health alerts the operator on, so
+        it must never be gated on the broker alone."""
+        return not (self.broker_connected or self._has_live_lots or self.has_ui_clients())
+
     def _load_price_keeper_watch_set(self) -> tuple[list, list]:
         """Sync DB fetch for _price_keeper_loop, run via asyncio.to_thread so a
         slow/contended query doesn't block the event loop (see call site)."""
@@ -5319,9 +5337,18 @@ class GridEngine:
 
     async def _price_keeper_loop(self) -> None:
         """Every second: refresh stale prices over REST, maintain feed_state,
-        and push a snapshot to the UI so prices tick every second on screen."""
+        and push a snapshot to the UI so prices tick every second on screen.
+        While _idle(), only one full pass runs per settings.idle_poll_interval;
+        the idle check itself is in-memory, so leaving idle (broker connects,
+        a dashboard opens) takes effect on the next 1s tick."""
         last_feed = ""
+        last_full = 0.0
         while True:
+            now_m = _time.monotonic()
+            if self._idle() and now_m - last_full < settings.idle_poll_interval:
+                await asyncio.sleep(settings.ui_push_interval)
+                continue
+            last_full = now_m
             try:
                 # feed heartbeat
                 silent = self.ws.seconds_since_rx()
@@ -5354,6 +5381,7 @@ class GridEngine:
                 # round trip — inline, a single slow/contended query here freezes the
                 # whole app (every request, every other loop) for as long as it takes.
                 instruments, lot_tokens = await asyncio.to_thread(self._load_price_keeper_watch_set)
+                self._has_live_lots = bool(lot_tokens)
                 self._watched_exchanges = {i.exch for i in instruments if i.exch}
                 keys = {(i.exch, i.token) for i in instruments if i.token}
                 keys |= {(e, t) for e, t in lot_tokens if t}

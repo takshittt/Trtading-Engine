@@ -71,6 +71,7 @@ class Settings:
     margin_safety_factor: float = 1.10   # require this multiple of SPAN+exposure free before a buy
     ui_push_interval: float = 1.0        # snapshot push to UI (price refresh every second)
     rollover_check_interval: float = 30.0
+    idle_poll_interval: float = 60.0     # price keeper's full-pass cadence while idle (no broker/UI/live lots)
 
     # Broker-status polling (the /api/status trading gate + UI badge). A DEFINITIVE
     # answer from the (WS-primary) gateway is trusted at once; only a gateway that is

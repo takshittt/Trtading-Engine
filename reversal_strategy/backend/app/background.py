@@ -43,6 +43,13 @@ def _start_price_feed() -> None:
 
 def _reconcile_loop() -> None:
     while True:
+        # No broker → nothing to reconcile against: the broker fetch would only
+        # fail and write a RECONCILE_ERROR audit row every pass, all night. The
+        # price warmer keeps STATE.broker_connected current from /api/status, so
+        # reconciliation resumes on its own once the broker is back.
+        if not STATE.broker_connected:
+            time.sleep(60)
+            continue
         db = session()
         try:
             cfg = get_config(db)
@@ -52,6 +59,8 @@ def _reconcile_loop() -> None:
         finally:
             db.close()
         time.sleep(interval)
+        if not STATE.broker_connected:      # dropped during the sleep
+            continue
         db = session()
         try:
             reconcile_once(db, source="MINUTE")
